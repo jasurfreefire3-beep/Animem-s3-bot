@@ -1,0 +1,14 @@
+services:
+  animem-s3-bot:
+    build: .
+    container_name: animem-s3-bot
+    restart: always
+    ports:
+      - "3000:3000"
+    env_file:
+      - .env
+    volumes:
+      - ./cache:/app/cache
+    environment:
+      - NODE_ENV=production
+      - PORT=3000

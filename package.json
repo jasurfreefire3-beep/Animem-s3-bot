@@ -1,0 +1,27 @@
+{
+  "name": "animem-s3-stream-bot",
+  "version": "1.0.0",
+  "description": "Telegram Video HLS & Direct MP4 Ultra-Fast Streaming Bot Server for Animem.uz",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "keywords": [
+    "telegram",
+    "streaming",
+    "hls",
+    "video",
+    "ffmpeg",
+    "animem"
+  ],
+  "author": "Animem.uz",
+  "license": "ISC",
+  "dependencies": {
+    "big-integer": "^1.6.52",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "telegram": "^2.26.22"
+  }
+}
