@@ -10,14 +10,50 @@
  * 4. Kanalga video yuklanganda orqa fonda avtomatik HLS ga bo'lib tayyorlab qo'yadi.
  */
 
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawn, spawnSync } = require('child_process');
+const { spawn, spawnSync, execSync } = require('child_process');
 const { EventEmitter } = require('events');
+
+// 1. Standalone .env parser (Tashqi 'dotenv' kutubxonasisiz mustaqil o'qish)
+try {
+  const envPath = path.join(__dirname, '.env');
+  if (fs.existsSync(envPath)) {
+    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
+    for (const rawLine of lines) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const eqIdx = line.indexOf('=');
+      if (eqIdx !== -1) {
+        const key = line.substring(0, eqIdx).trim();
+        let val = line.substring(eqIdx + 1).trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        if (!process.env[key]) {
+          process.env[key] = val;
+        }
+      }
+    }
+  }
+} catch (e) {
+  console.warn('.env o\'qishda ogohlantirish:', e?.message || e);
+}
+
+// 2. Agar node_modules hali o'rnatilmagan bo'lsa, avtomatik o'rnatish!
+if (!fs.existsSync(path.join(__dirname, 'node_modules', 'express')) || !fs.existsSync(path.join(__dirname, 'node_modules', 'telegram'))) {
+  console.log('📦 VPS da kerakli kutubxonalar topilmadi. Avtomatik "npm install" bajarilmoqda, iltimos kuting...');
+  try {
+    execSync('npm install --production', { cwd: __dirname, stdio: 'inherit' });
+    console.log('✅ Barcha kerakli kutubxonalar muvaffaqiyatli o\'rnatildi!');
+  } catch (err) {
+    console.error('❌ Avtomatik npm install da xatolik. Terminalda "npm install" ni qo\'lda bajaring:', err?.message || err);
+  }
+}
+
+const express = require('express');
+const cors = require('cors');
 const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 const { NewMessage } = require('telegram/events');
