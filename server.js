@@ -304,6 +304,8 @@ function registerTelegramEventHandler(tgClient) {
         `<code>${hlsUrl}</code>\n\n` +
         `🔗 <b>2. To'g'ridan-to'g'ri MP4 URL (Direct MP4 Stream):</b>\n` +
         `<code>${mp4Url}</code>\n\n` +
+        `▶️ <b>3. Onlayn Pleyer (Brauzerda to'g'ridan-to'g'ri ko'rish):</b>\n` +
+        `<code>https://${TG_STREAM_DOMAIN}/player/${cleanChannelId}/${messageId}</code>\n\n` +
         `🛡 <b>Xavfsizlik:</b> Faqat Animem.uz saytida va rasmiy brauzer pleyerida ishlaydi.\n\n` +
         `💡 <i>Sayt Admin panelidagi qism "video_url" maydoniga <b>HLS (.m3u8)</b> havolasini qo'yish tavsiya etiladi. 10,000 odam bir vaqtda kirganda ham video qotmasdan, YouTube kabi bir zumda ochiladi!</i>`;
 
@@ -381,6 +383,8 @@ function sliceSegmentSync(inputFile, videoFolder, segIdx, isHevc = false) {
     '-t', String(HLS_SEGMENT_DURATION),
     '-c', 'copy',
     '-bsf:v', bsfFilter,
+    '-avoid_negative_ts', 'make_zero',
+    '-fflags', '+genpts',
     '-f', 'mpegts',
     '-y',
     tempSegFile
@@ -406,6 +410,8 @@ function sliceSegmentSync(inputFile, videoFolder, segIdx, isHevc = false) {
     '-c:v', 'copy',
     '-bsf:v', bsfFilter,
     '-c:a', 'aac',
+    '-avoid_negative_ts', 'make_zero',
+    '-fflags', '+genpts',
     '-f', 'mpegts',
     '-y',
     tempSegFile
@@ -532,13 +538,17 @@ async function ensureVideoProcessing(channelId, messageId) {
         '-i', sourceFile,
         '-c', 'copy',
         '-bsf:v', bsfFilter,
+        '-avoid_negative_ts', 'make_zero',
+        '-fflags', '+genpts',
         '-f', 'hls',
         '-hls_time', String(HLS_SEGMENT_DURATION),
         '-hls_list_size', '0',
+        '-hls_flags', 'independent_segments',
+        '-hls_playlist_type', 'vod',
         '-hls_segment_filename', path.join(videoFolder, 'segment_%d.ts'),
         '-y',
         indexFile
-      ], { timeout: 60000 });
+      ], { timeout: 90000 });
 
       if (hlsRes.status !== 0) {
         spawnSync(ffmpegBin, [
@@ -546,9 +556,13 @@ async function ensureVideoProcessing(channelId, messageId) {
           '-c:v', 'copy',
           '-bsf:v', bsfFilter,
           '-c:a', 'aac',
+          '-avoid_negative_ts', 'make_zero',
+          '-fflags', '+genpts',
           '-f', 'hls',
           '-hls_time', String(HLS_SEGMENT_DURATION),
           '-hls_list_size', '0',
+          '-hls_flags', 'independent_segments',
+          '-hls_playlist_type', 'vod',
           '-hls_segment_filename', path.join(videoFolder, 'segment_%d.ts'),
           '-y',
           indexFile
@@ -745,8 +759,279 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
   }
 });
 
-// 2. HLS Master Playlist
-app.get('/api/tghls/:channelId/:messageId/master.m3u8', async (req, res) => {
+// Helper: Brauzerda ochilganda YouTube uslubidagi Hls.js pleyerini chizish
+function renderBrowserPlayerHtml(channelId, messageId, m3u8Url, mp4Url) {
+  return `<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Animem.uz - HLS Video Player</title>
+  <link rel="icon" href="https://animem.uz/favicon.ico">
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: #0b0c0f;
+      color: #fff;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+    .header {
+      height: 52px;
+      background: #14151a;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 20px;
+      border-bottom: 1px solid #23252b;
+      z-index: 10;
+    }
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: #ff006a;
+      font-weight: 800;
+      font-size: 18px;
+      letter-spacing: -0.5px;
+    }
+    .badge {
+      background: rgba(255, 0, 106, 0.15);
+      color: #ff006a;
+      border: 1px solid rgba(255, 0, 106, 0.3);
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .btn {
+      background: #23252b;
+      color: #e0e0e0;
+      border: 1px solid #33363f;
+      padding: 6px 12px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: all 0.15s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .btn:hover {
+      background: #2d3039;
+      color: #fff;
+      border-color: #ff006a;
+    }
+    .btn-primary {
+      background: #ff006a;
+      border-color: #ff006a;
+      color: #fff;
+    }
+    .btn-primary:hover {
+      background: #e6005f;
+    }
+    .player-container {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      position: relative;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      max-height: calc(100vh - 52px);
+      outline: none;
+      background: #000;
+    }
+    .loading-overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 14px;
+      z-index: 5;
+      transition: opacity 0.3s ease;
+    }
+    .loading-overlay.hidden {
+      opacity: 0;
+      pointer-events: none;
+    }
+    .spinner {
+      width: 44px;
+      height: 44px;
+      border: 4px solid rgba(255, 0, 106, 0.2);
+      border-top-color: #ff006a;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+    .status-text {
+      font-size: 13px;
+      color: #bbb;
+      font-weight: 500;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <a href="https://animem.uz" class="logo" target="_blank">
+      ANIMEM.UZ <span class="badge">HLS PRO STREAM</span>
+    </a>
+    <div class="actions">
+      <a href="${mp4Url}" class="btn" title="To'g'ridan-to'g'ri MP4 oqimi">Direct MP4</a>
+      <button class="btn" onclick="copyM3u8()" id="copyBtn">📋 Havolani olish</button>
+      <a href="https://animem.uz" class="btn btn-primary" target="_blank">Animem.uz Sayti</a>
+    </div>
+  </div>
+
+  <div class="player-container">
+    <div class="loading-overlay" id="loader">
+      <div class="spinner"></div>
+      <div class="status-text" id="statusText">Video yuklanmoqda...</div>
+    </div>
+    <video id="video" controls autoplay playsinline preload="auto"></video>
+  </div>
+
+  <script>
+    const m3u8Url = '${m3u8Url}';
+    const mp4Url = '${mp4Url}';
+    const video = document.getElementById('video');
+    const loader = document.getElementById('loader');
+    const statusText = document.getElementById('statusText');
+
+    function hideLoader() {
+      if (loader) loader.classList.add('hidden');
+    }
+
+    function showStatus(text) {
+      if (statusText) statusText.innerText = text;
+      if (loader) loader.classList.remove('hidden');
+    }
+
+    function copyM3u8() {
+      const fullUrl = window.location.origin + m3u8Url.replace('?raw=1', '');
+      navigator.clipboard.writeText(fullUrl).then(() => {
+        const btn = document.getElementById('copyBtn');
+        btn.innerText = '✅ Nusxa olindi!';
+        setTimeout(() => { btn.innerText = '📋 Havolani olish'; }, 2000);
+      });
+    }
+
+    window.addEventListener('keydown', (e) => {
+      if (['Space', 'KeyK'].includes(e.code)) {
+        e.preventDefault();
+        video.paused ? video.play() : video.pause();
+      } else if (e.code === 'ArrowLeft') {
+        e.preventDefault();
+        video.currentTime = Math.max(0, video.currentTime - 5);
+      } else if (e.code === 'ArrowRight') {
+        e.preventDefault();
+        video.currentTime = Math.min(video.duration || 0, video.currentTime + 5);
+      } else if (e.code === 'ArrowUp') {
+        e.preventDefault();
+        video.volume = Math.min(1, video.volume + 0.1);
+      } else if (e.code === 'ArrowDown') {
+        e.preventDefault();
+        video.volume = Math.max(0, video.volume - 0.1);
+      } else if (e.code === 'KeyF') {
+        e.preventDefault();
+        if (!document.fullscreenElement) {
+          video.requestFullscreen().catch(() => {});
+        } else {
+          document.exitFullscreen().catch(() => {});
+        }
+      } else if (e.code === 'KeyM') {
+        e.preventDefault();
+        video.muted = !video.muted;
+      }
+    });
+
+    if (window.Hls && Hls.isSupported()) {
+      const hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: false,
+        backBufferLength: 90,
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        startFragPrefetch: true
+      });
+
+      hls.loadSource(m3u8Url);
+      hls.attachMedia(video);
+
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        hideLoader();
+        video.play().catch(() => {});
+      });
+
+      hls.on(Hls.Events.FRAG_BUFFERED, () => {
+        hideLoader();
+      });
+
+      hls.on(Hls.Events.ERROR, (event, data) => {
+        console.warn('HLS Event Error:', data);
+        if (data.fatal) {
+          switch (data.type) {
+            case Hls.ErrorTypes.NETWORK_ERROR:
+              showStatus("Tarmoq xatosi, qayta ulanmoqda...");
+              hls.startLoad();
+              break;
+            case Hls.ErrorTypes.MEDIA_ERROR:
+              showStatus("Video tiklanmoqda...");
+              hls.recoverMediaError();
+              break;
+            default:
+              console.warn("Fatal error, falling back to MP4...");
+              hls.destroy();
+              video.src = mp4Url;
+              video.play().catch(() => {});
+              hideLoader();
+              break;
+          }
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = m3u8Url;
+      video.addEventListener('loadedmetadata', () => {
+        hideLoader();
+        video.play().catch(() => {});
+      });
+    } else {
+      video.src = mp4Url;
+      hideLoader();
+      video.play().catch(() => {});
+    }
+
+    video.addEventListener('playing', hideLoader);
+    video.addEventListener('canplay', hideLoader);
+  </script>
+</body>
+</html>`;
+}
+
+// 2. HLS Master Playlist & Browser Player
+app.get(['/api/tghls/:channelId/:messageId/master.m3u8', '/player/:channelId/:messageId'], async (req, res) => {
   const { channelId, messageId } = req.params;
   const numMsgId = parseInt(messageId, 10);
   if (!channelId || isNaN(numMsgId)) {
@@ -756,6 +1041,17 @@ app.get('/api/tghls/:channelId/:messageId/master.m3u8', async (req, res) => {
   const authCheck = isAuthorizedStreamRequest(req);
   if (!authCheck.allowed) {
     return res.status(403).json({ error: "Kirish taqiqlangan" });
+  }
+
+  const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
+  const isHtmlRequest = req.headers.accept && req.headers.accept.includes('text/html') && !req.query.raw;
+
+  // Agar brauzerda to'g'ridan-to'g'ri ochilsa, Hls.js pleyerini ko'rsatish
+  if (isHtmlRequest) {
+    const rawM3u8Url = `/api/tghls/${cleanId}/${numMsgId}/master.m3u8?raw=1`;
+    const mp4FallbackUrl = `/api/tgstream/${cleanId}/${numMsgId}`;
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.status(200).send(renderBrowserPlayerHtml(cleanId, numMsgId, rawM3u8Url, mp4FallbackUrl));
   }
 
   // Pre-process in background
@@ -768,7 +1064,6 @@ app.get('/api/tghls/:channelId/:messageId/master.m3u8', async (req, res) => {
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
   res.setHeader('Cache-Control', 'public, max-age=3600');
 
-  const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
   const playlist = 
     `#EXTM3U\n` +
     `#EXT-X-VERSION:3\n` +
@@ -793,6 +1088,11 @@ app.get('/api/tghls/:channelId/:messageId/index.m3u8', async (req, res) => {
   }
 
   const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
+  const isHtmlRequest = req.headers.accept && req.headers.accept.includes('text/html') && !req.query.raw;
+  if (isHtmlRequest) {
+    return res.redirect(`/api/tghls/${cleanId}/${numMsgId}/master.m3u8`);
+  }
+
   const videoFolder = path.join(HLS_CACHE_DIR, `${cleanId}_${numMsgId}`);
   const indexFile = path.join(videoFolder, 'index.m3u8');
 
@@ -808,7 +1108,7 @@ app.get('/api/tghls/:channelId/:messageId/index.m3u8', async (req, res) => {
   if (fs.existsSync(indexFile)) {
     try {
       let content = await fs.promises.readFile(indexFile, 'utf8');
-      content = content.replace(/(segment_\d+\.ts)/g, `/api/tghls/${cleanId}/${numMsgId}/$1`);
+      content = content.replace(/(^|[^/])(segment_\d+\.ts)/gm, `$1/api/tghls/${cleanId}/${numMsgId}/$2`);
       return res.status(200).send(content);
     } catch {}
   }
