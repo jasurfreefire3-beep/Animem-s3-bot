@@ -379,6 +379,27 @@ function extractMediaFromMessage(message) {
 // ============================================================================
 // TELEGRAM MIJOZI (GRAMJS) VA XABARLARNI TINGLASH
 // ============================================================================
+function getValidFileReference(doc) {
+  if (!doc || !doc.fileReference) return Buffer.alloc(0);
+  if (Buffer.isBuffer(doc.fileReference)) return doc.fileReference;
+  if (doc.fileReference.data && Array.isArray(doc.fileReference.data)) {
+    return Buffer.from(doc.fileReference.data);
+  }
+  if (typeof doc.fileReference === 'string') {
+    return Buffer.from(doc.fileReference, 'base64');
+  }
+  return Buffer.from(doc.fileReference);
+}
+
+function createDocumentLocation(doc) {
+  return new Api.InputDocumentFileLocation({
+    id: bigInt(doc.id),
+    accessHash: bigInt(doc.accessHash),
+    fileReference: getValidFileReference(doc),
+    thumbSize: '',
+  });
+}
+
 let client = null;
 let isInitializing = false;
 
@@ -799,12 +820,7 @@ async function ensureVideoProcessing(channelId, messageId) {
       }
 
       const tgClient = await getTelegramClient();
-      const fileLocation = new Api.InputDocumentFileLocation({
-        id: meta.document.id,
-        accessHash: meta.document.accessHash,
-        fileReference: meta.document.fileReference,
-        thumbSize: '',
-      });
+      const fileLocation = createDocumentLocation(meta.document);
 
       const TG_CHUNK_SIZE = 512 * 1024;
       let startOffset = state.bytesDownloaded;
@@ -995,12 +1011,7 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     }
 
     const tgClient = await getTelegramClient();
-    const fileLocation = new Api.InputDocumentFileLocation({
-      id: meta.document.id,
-      accessHash: meta.document.accessHash,
-      fileReference: meta.document.fileReference,
-      thumbSize: '',
-    });
+    const fileLocation = createDocumentLocation(meta.document);
 
     const TG_CHUNK_SIZE = 512 * 1024;
     const alignedStart = Math.floor(start / TG_CHUNK_SIZE) * TG_CHUNK_SIZE;
