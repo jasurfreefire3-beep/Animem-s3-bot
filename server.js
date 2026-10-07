@@ -17,6 +17,14 @@ const os = require('os');
 const { spawn, execSync } = require('child_process');
 const { EventEmitter } = require('events');
 
+// Global xatoliklar ushlagichi (server noxosdan to'xtab qolmasligi uchun)
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ [Server] Uncaught Exception:', err?.message || err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ [Server] Unhandled Rejection:', reason?.message || reason);
+});
+
 // 1. Standalone .env parser
 try {
   const envPath = path.join(__dirname, '.env');
@@ -70,14 +78,14 @@ const TG_BOT_TOKEN = process.env.TG_STREAM_BOT_TOKEN || '8969080492:AAFeXz93y6Cj
 const TG_STREAM_DOMAIN = process.env.TG_STREAM_DOMAIN || 's3.animem.uz';
 const HLS_SEGMENT_DURATION = 6; // 6 soniyalik HLS segmentlar
 const HLS_MAX_CACHE_ITEMS = 120; // RAM kesh limiti (segmentlar soni)
-const HLS_CACHE_DIR = process.env.HLS_CACHE_DIR || path.join(__dirname, 'cache');
+const HLS_CACHE_DIR = path.resolve(__dirname, process.env.HLS_CACHE_DIR || 'cache');
 
 if (!fs.existsSync(HLS_CACHE_DIR)) {
   fs.mkdirSync(HLS_CACHE_DIR, { recursive: true });
 }
 
 // Doimiy ishlaydigan zaxira sessiya (AUTH_KEY_UNREGISTERED va FLOOD_WAIT ning oldini oladi)
-const DEFAULT_VERIFIED_SESSION = '1AgAOMTQ5LjE1NC4xNjcuNDEBuywqrlzOPyU0sP4U6A7NVpWC/gLSpY2bbRYaFBIdHRVsJnd86O8OKpuUir7VATMWKi+wk8YIDcRixe3pTEFv+inxUOXKMfsagtr55/PXSTSSR3nxiFAcSB/E/doUP4nrBIfzMtipBUi47UyXxYgT+4yQgRENmHAfZqSQQ2YPdIA7VxX7xwBW6rOSl782FIRRLRdosyE6QRaxqssV9pAqtM2z4FNXAhMQg5ILwsw12Prxs5RMey+7I5kqOrJ89ZVgqY/ivh5QWetHupZ5pTBjBPLgLwHnSAJhJLpYXrfyFBs8OvZ+pgPMyEnFLKfO2CPrffPFAo8O4AFmzllGCjGGNxY=';
+const DEFAULT_VERIFIED_SESSION = '1AgAOMTQ5LjE1NC4xNjcuNTEBuxOcQMgGpwIDM6ZoO26uVoE0bg9YRumiETYCG1gyZwFPHeiJfvGua1MFeYBAboD29xpq7Gz69EDmw2Sx+G0H5EmNIcCh62hjF2Fq+V6+j81Tasqe/LS9wPWRVxHb2K1D0T4GeDJKAXnAvl371KEOoNXjdT28Kh09kQVYkpygd92qmvnfARqd2ZATA5fO4zmh8WRjMsE0C6wFkW1Y8upMT7b8rFzRTqIhyF/anOxtBhH17EeqXL21ZZqAXbi51oMydHgk2vwuxzeLit5xTZ0hDs8jVt/l8xHh3TzPLyAnzdiS9FFKs09dO6T4m2LQbOxUU7HHt/QO3bgbjbq9u8YZOjs=';
 const SESSION_FILE = path.join(HLS_CACHE_DIR, 'session.txt');
 const CHANNELS_FILE = path.join(HLS_CACHE_DIR, 'channels.json');
 const METADATA_FILE = path.join(HLS_CACHE_DIR, 'metadata.json');
@@ -231,12 +239,15 @@ function cleanDiskSpace() {
       }
     }
 
-    // Bo'sh qolgan papkalarni tozalash
+    // Bo'sh qolgan papkalarni tozalash (faqat kamida 15 daqiqa oldin yaratilgan va hozir faol bo'lmagan)
     const remainingEntries = fs.readdirSync(HLS_CACHE_DIR);
     for (const entry of remainingEntries) {
+      if (activeVideoDownloads.has(entry)) continue;
       const fullPath = path.join(HLS_CACHE_DIR, entry);
       try {
         if (fs.existsSync(fullPath) && fs.statSync(fullPath).isDirectory()) {
+          const stat = fs.statSync(fullPath);
+          if (now - stat.mtimeMs < 15 * 60 * 1000) continue;
           const inner = fs.readdirSync(fullPath);
           if (inner.length === 0) {
             fs.rmdirSync(fullPath);
@@ -394,7 +405,6 @@ async function getTelegramClient() {
     }
 
     const session = new StringSession(sessionString);
-    session.setDC(2, '149.154.167.41', 443);
 
     client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
       connectionRetries: 5,
@@ -780,11 +790,13 @@ async function ensureVideoProcessing(channelId, messageId) {
 
   activeVideoDownloads.set(key, state);
 
-  enqueueVideoTask(async () => {
+    enqueueVideoTask(async () => {
     let writeStream = null;
     let downloadStream = null;
     try {
-      cleanDiskSpace();
+      if (!fs.existsSync(videoFolder)) {
+        fs.mkdirSync(videoFolder, { recursive: true });
+      }
 
       const tgClient = await getTelegramClient();
       const fileLocation = new Api.InputDocumentFileLocation({
@@ -802,7 +814,14 @@ async function ensureVideoProcessing(channelId, messageId) {
       const remainingBytes = meta.size - startOffset;
       const chunkLimit = Math.ceil(remainingBytes / TG_CHUNK_SIZE);
 
+      if (!fs.existsSync(videoFolder)) {
+        fs.mkdirSync(videoFolder, { recursive: true });
+      }
+
       writeStream = fs.createWriteStream(partFile, { flags: startOffset > 0 ? 'a' : 'w' });
+      writeStream.on('error', (err) => {
+        console.warn(`[HLS Streamer] WriteStream xatosi (${key}):`, err?.message || err);
+      });
 
       downloadStream = tgClient.iterDownload({
         file: fileLocation,
@@ -817,7 +836,9 @@ async function ensureVideoProcessing(channelId, messageId) {
       let seg1Done = fs.existsSync(path.join(videoFolder, 'segment_1.ts'));
 
       for await (const chunk of downloadStream) {
-        writeStream.write(chunk);
+        if (!writeStream.writableEnded && !writeStream.destroyed) {
+          writeStream.write(chunk);
+        }
         state.bytesDownloaded += chunk.length;
         touchVideoAccess(key);
         state.emitter.emit('progress', state.bytesDownloaded);
@@ -843,7 +864,10 @@ async function ensureVideoProcessing(channelId, messageId) {
         }
       }
 
-      await new Promise(resolve => writeStream.end(resolve));
+      await new Promise((resolve) => {
+        if (writeStream.writableEnded) return resolve();
+        writeStream.end(resolve);
+      });
 
       // Yuklab olish tugadi: .part ni .mp4 ga o'tkazish
       if (fs.existsSync(partFile)) {
@@ -868,7 +892,7 @@ async function ensureVideoProcessing(channelId, messageId) {
       state.error = err?.message || String(err);
       state.emitter.emit('error', state.error);
     } finally {
-      if (writeStream && !writeStream.destroyed) {
+      if (writeStream && !writeStream.destroyed && !writeStream.writableEnded) {
         try { writeStream.destroy(); } catch {}
       }
       if (typeof downloadStream?.return === 'function') {
@@ -1343,7 +1367,8 @@ app.get(['/api/tghls/:channelId/:messageId/master.m3u8', '/player/:channelId/:me
 
   const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
   touchVideoAccess(`${cleanId}_${numMsgId}`);
-  const isHtmlRequest = req.headers.accept && req.headers.accept.includes('text/html') && !req.query.raw;
+  const isPlayerPath = req.path.startsWith('/player/');
+  const isHtmlRequest = isPlayerPath || (req.headers.accept && req.headers.accept.includes('text/html') && !req.query.raw);
 
   // Agar brauzerda to'g'ridan-to'g'ri ochilsa, Hls.js pleyerini ko'rsatish
   if (isHtmlRequest) {
@@ -1514,32 +1539,60 @@ app.get('/api/tghls/:channelId/:messageId/segment_:segmentNum.ts', async (req, r
     }
   }
 
-  // 4. Agar hali yetib kelmagan bo'lsa, yuklash oqimini asinxron kutish (maksimum 12 soniya)
+  // 4. Agar hali yetib kelmagan bo'lsa, yuklash oqimini asinxron kutish (maksimum 35 soniya)
   if (state && !state.isCompleted) {
     const meta = await getStreamMetadata(channelId, numMsgId);
     await new Promise((resolve) => {
       let resolved = false;
+      let isSlicing = false;
+
+      const trySlice = async () => {
+        if (resolved || isSlicing) return;
+        const currentInput = fs.existsSync(sourceFile) ? sourceFile : (fs.existsSync(partFile) ? partFile : null);
+        if (currentInput) {
+          isSlicing = true;
+          try {
+            const ok = await sliceSegmentAsync(currentInput, videoFolder, numSeg, meta?.isHevc);
+            if (ok) cleanup();
+          } finally {
+            isSlicing = false;
+          }
+        }
+      };
+
       const cleanup = () => {
         if (resolved) return;
         resolved = true;
         clearTimeout(timer);
         state.emitter.off('progress', onProgress);
+        state.emitter.off('segment_ready', onSegmentReady);
         state.emitter.off('completed', onCompleted);
         state.emitter.off('error', onError);
         resolve();
       };
 
-      const timer = setTimeout(cleanup, 12000);
-      const onProgress = async () => {
-        const currentInput = fs.existsSync(sourceFile) ? sourceFile : (fs.existsSync(partFile) ? partFile : null);
-        if (currentInput) {
-          const ok = await sliceSegmentAsync(currentInput, videoFolder, numSeg, meta?.isHevc);
-          if (ok) cleanup();
+      const timer = setTimeout(cleanup, 35000);
+
+      const onSegmentReady = (idx) => {
+        if (idx === numSeg) cleanup();
+      };
+
+      let lastCheck = 0;
+      const onProgress = () => {
+        const now = Date.now();
+        if (now - lastCheck > 1500) {
+          lastCheck = now;
+          trySlice();
         }
       };
-      const onCompleted = () => { cleanup(); };
+
+      const onCompleted = () => {
+        trySlice().finally(cleanup);
+      };
+
       const onError = () => { cleanup(); };
 
+      state.emitter.on('segment_ready', onSegmentReady);
       state.emitter.on('progress', onProgress);
       state.emitter.on('completed', onCompleted);
       state.emitter.on('error', onError);
