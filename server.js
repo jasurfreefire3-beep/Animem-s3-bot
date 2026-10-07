@@ -8,15 +8,16 @@
  * 2. MP4 (HTTP 206 Partial Content) formatida to'g'ridan-to'g'ri uzatadi.
  * 3. Anti-leech (begona saytlardan o'g'irlab qo'yishdan) himoya qiladi.
  * 4. Kanalga video yuklanganda orqa fonda avtomatik HLS ga bo'lib tayyorlab qo'yadi.
+ * 5. VPS diskini va keshini har 1 soatda avtomatik tozalaydi.
  */
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { spawn, spawnSync, execSync } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const { EventEmitter } = require('events');
 
-// 1. Standalone .env parser (Tashqi 'dotenv' kutubxonasisiz mustaqil o'qish)
+// 1. Standalone .env parser
 try {
   const envPath = path.join(__dirname, '.env');
   if (fs.existsSync(envPath)) {
@@ -41,14 +42,14 @@ try {
   console.warn('.env o\'qishda ogohlantirish:', e?.message || e);
 }
 
-// 2. Agar node_modules hali o'rnatilmagan bo'lsa, avtomatik o'rnatish!
+// 2. Kutubxonalar tekshiruvi
 if (!fs.existsSync(path.join(__dirname, 'node_modules', 'express')) || !fs.existsSync(path.join(__dirname, 'node_modules', 'telegram'))) {
-  console.log('📦 VPS da kerakli kutubxonalar topilmadi. Avtomatik "npm install" bajarilmoqda, iltimos kuting...');
+  console.log('📦 VPS da kerakli kutubxonalar topilmadi. Avtomatik "npm install" bajarilmoqda...');
   try {
     execSync('npm install --production', { cwd: __dirname, stdio: 'inherit' });
     console.log('✅ Barcha kerakli kutubxonalar muvaffaqiyatli o\'rnatildi!');
   } catch (err) {
-    console.error('❌ Avtomatik npm install da xatolik. Terminalda "npm install" ni qo\'lda bajaring:', err?.message || err);
+    console.error('❌ Avtomatik npm install da xatolik:', err?.message || err);
   }
 }
 
@@ -67,13 +68,19 @@ const TG_API_ID = parseInt(process.env.TG_API_ID || '6', 10);
 const TG_API_HASH = process.env.TG_API_HASH || 'eb06d4abfb49dc3eeb1aeb98ae0f581e';
 const TG_BOT_TOKEN = process.env.TG_STREAM_BOT_TOKEN || '8969080492:AAFeXz93y6CjIBv0AmdlfVlE0N53gf_J6gY';
 const TG_STREAM_DOMAIN = process.env.TG_STREAM_DOMAIN || 's3.animem.uz';
-const HLS_SEGMENT_DURATION = 6; // 6 soniyalik segmentlar
-const HLS_MAX_CACHE_ITEMS = 800; // RAM dagi kesh limiti (~1GB)
+const HLS_SEGMENT_DURATION = 6; // 6 soniyalik HLS segmentlar
+const HLS_MAX_CACHE_ITEMS = 120; // RAM kesh limiti (segmentlar soni)
 const HLS_CACHE_DIR = process.env.HLS_CACHE_DIR || path.join(__dirname, 'cache');
 
 if (!fs.existsSync(HLS_CACHE_DIR)) {
   fs.mkdirSync(HLS_CACHE_DIR, { recursive: true });
 }
+
+// Doimiy ishlaydigan zaxira sessiya (AUTH_KEY_UNREGISTERED va FLOOD_WAIT ning oldini oladi)
+const DEFAULT_VERIFIED_SESSION = '1AgAOMTQ5LjE1NC4xNjcuNDEBuywqrlzOPyU0sP4U6A7NVpWC/gLSpY2bbRYaFBIdHRVsJnd86O8OKpuUir7VATMWKi+wk8YIDcRixe3pTEFv+inxUOXKMfsagtr55/PXSTSSR3nxiFAcSB/E/doUP4nrBIfzMtipBUi47UyXxYgT+4yQgRENmHAfZqSQQ2YPdIA7VxX7xwBW6rOSl782FIRRLRdosyE6QRaxqssV9pAqtM2z4FNXAhMQg5ILwsw12Prxs5RMey+7I5kqOrJ89ZVgqY/ivh5QWetHupZ5pTBjBPLgLwHnSAJhJLpYXrfyFBs8OvZ+pgPMyEnFLKfO2CPrffPFAo8O4AFmzllGCjGGNxY=';
+const SESSION_FILE = path.join(HLS_CACHE_DIR, 'session.txt');
+const CHANNELS_FILE = path.join(HLS_CACHE_DIR, 'channels.json');
+const METADATA_FILE = path.join(HLS_CACHE_DIR, 'metadata.json');
 
 // FFmpeg binar faylini aniqlash
 function getFfmpegBinary() {
@@ -91,28 +98,166 @@ function getFfmpegBinary() {
   return 'ffmpeg';
 }
 
-// In-memory keshlash
+// In-memory va doimiy keshlash
 const mediaMetaCache = new Map();
 const videoHeadCache = new Map();
 const hlsSegmentCache = new Map();
 const activeVideoDownloads = new Map();
+const videoAccessMap = new Map();
 
-// 7 kundan eski kesh papkalarini avtomatik tozalash (har soatda)
-function cleanOldHlsCache() {
+// Ma'lum kanallar ro'yxati (MTProto da accessHash bo'lmasa entity topilmaydi)
+const knownChannels = new Map();
+knownChannels.set('3873627200', {
+  channelId: '3873627200',
+  accessHash: '-4392074857025164406',
+  title: 'Animem UZ s3 bazasi‼️'
+});
+
+function loadPersistedData() {
   try {
-    if (!fs.existsSync(HLS_CACHE_DIR)) return;
-    const entries = fs.readdirSync(HLS_CACHE_DIR);
-    const now = Date.now();
-    for (const entry of entries) {
-      const fullPath = path.join(HLS_CACHE_DIR, entry);
-      const stat = fs.statSync(fullPath);
-      if (stat.isDirectory() && (now - stat.mtimeMs > 7 * 86400 * 1000)) {
-        fs.rmSync(fullPath, { recursive: true, force: true });
+    if (fs.existsSync(CHANNELS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(CHANNELS_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(data)) {
+        knownChannels.set(String(k), v);
+      }
+    }
+  } catch {}
+
+  try {
+    if (fs.existsSync(METADATA_FILE)) {
+      const data = JSON.parse(fs.readFileSync(METADATA_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(data)) {
+        mediaMetaCache.set(String(k), v);
       }
     }
   } catch {}
 }
-setInterval(cleanOldHlsCache, 3600000);
+
+function savePersistedChannels() {
+  try {
+    const obj = {};
+    for (const [k, v] of knownChannels.entries()) obj[k] = v;
+    fs.writeFileSync(CHANNELS_FILE, JSON.stringify(obj, null, 2));
+  } catch {}
+}
+
+function savePersistedMetadata() {
+  try {
+    const obj = {};
+    for (const [k, v] of mediaMetaCache.entries()) obj[k] = v;
+    fs.writeFileSync(METADATA_FILE, JSON.stringify(obj, null, 2));
+  } catch {}
+}
+
+loadPersistedData();
+
+function touchVideoAccess(key) {
+  videoAccessMap.set(key, Date.now());
+}
+
+// ============================================================================
+// KESH VA DISKNI AVTOMATIK TOZALASH (HAR 1 SOATDA)
+// ============================================================================
+function cleanDiskSpace() {
+  try {
+    if (!fs.existsSync(HLS_CACHE_DIR)) return;
+    const now = Date.now();
+    const entries = fs.readdirSync(HLS_CACHE_DIR);
+    const folderStats = [];
+    let totalCacheBytes = 0;
+
+    for (const entry of entries) {
+      const fullPath = path.join(HLS_CACHE_DIR, entry);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          // Ayni paytda faol yuklanayotgan videoni o'chirib yubormaslik
+          if (activeVideoDownloads.has(entry)) {
+            continue;
+          }
+
+          let dirSize = 0;
+          let latestTime = stat.mtimeMs;
+          const lastAccessed = videoAccessMap.get(entry) || stat.mtimeMs;
+          const files = fs.readdirSync(fullPath);
+
+          for (const f of files) {
+            const fPath = path.join(fullPath, f);
+            try {
+              const fStat = fs.statSync(fPath);
+              dirSize += fStat.size;
+              if (fStat.mtimeMs > latestTime) latestTime = fStat.mtimeMs;
+
+              // 30 daqiqadan eski chala .part fayllarni tozalash (yuklash uzilib qolgan bo'lsa)
+              if (f.endsWith('.part') && (now - fStat.mtimeMs > 30 * 60 * 1000)) {
+                try { fs.unlinkSync(fPath); } catch {}
+              }
+              // 10 daqiqadan eski vaqtinchalik temp_seg fayllarni tozalash
+              if (f.startsWith('temp_seg_') && (now - fStat.mtimeMs > 10 * 60 * 1000)) {
+                try { fs.unlinkSync(fPath); } catch {}
+              }
+            } catch {}
+          }
+
+          const effectiveTime = Math.max(latestTime, lastAccessed);
+
+          // 24 soatdan ortiq foydalanilmagan kesh papkalarini o'chirish
+          if (now - effectiveTime > 24 * 3600 * 1000) {
+            try { fs.rmSync(fullPath, { recursive: true, force: true }); } catch {}
+            videoAccessMap.delete(entry);
+            continue;
+          }
+
+          totalCacheBytes += dirSize;
+          folderStats.push({ path: fullPath, size: dirSize, time: effectiveTime, key: entry });
+        }
+      } catch {}
+    }
+
+    // Disk keshining umumiy hajmi 2.5 GB dan oshsa, eng eski foydalanilmagan papkalarni o'chirish
+    const MAX_CACHE_BYTES = 2.5 * 1024 * 1024 * 1024;
+    const TARGET_CACHE_BYTES = 1.2 * 1024 * 1024 * 1024;
+    if (totalCacheBytes > MAX_CACHE_BYTES) {
+      folderStats.sort((a, b) => a.time - b.time);
+      for (const item of folderStats) {
+        if (totalCacheBytes <= TARGET_CACHE_BYTES) break;
+        // Oxirgi 4 soat ichida ko'rilgan videolarni o'chirmaslik
+        if (now - item.time < 4 * 3600 * 1000) continue;
+        try {
+          fs.rmSync(item.path, { recursive: true, force: true });
+          videoAccessMap.delete(item.key);
+          totalCacheBytes -= item.size;
+        } catch {}
+      }
+    }
+
+    // Bo'sh qolgan papkalarni tozalash
+    const remainingEntries = fs.readdirSync(HLS_CACHE_DIR);
+    for (const entry of remainingEntries) {
+      const fullPath = path.join(HLS_CACHE_DIR, entry);
+      try {
+        if (fs.existsSync(fullPath) && fs.statSync(fullPath).isDirectory()) {
+          const inner = fs.readdirSync(fullPath);
+          if (inner.length === 0) {
+            fs.rmdirSync(fullPath);
+          }
+        }
+      } catch {}
+    }
+
+    // RAM keshini tozalash (xotira toshishining oldini olish)
+    if (hlsSegmentCache.size > HLS_MAX_CACHE_ITEMS) {
+      hlsSegmentCache.clear();
+    }
+  } catch (err) {
+    console.warn('[Disk Cleaner] Tozalashda ogohlantirish:', err?.message || err);
+  }
+}
+
+// Har 1 soatda avtomatik tozalab turish (3600000 ms)
+setInterval(cleanDiskSpace, 3600000);
+// Server ishga tushishi bilan bir marta tozalash
+cleanDiskSpace();
 
 // ============================================================================
 // YORDAMCHI FUNKSIYALAR
@@ -238,24 +383,44 @@ async function getTelegramClient() {
 
   isInitializing = true;
   try {
-    const session = new StringSession(process.env.TG_STREAM_SESSION || '');
-    if (!process.env.TG_STREAM_SESSION) {
-      session.setDC(2, '149.154.167.41', 443);
+    let sessionString = process.env.TG_STREAM_SESSION || '';
+    if (!sessionString && fs.existsSync(SESSION_FILE)) {
+      try {
+        sessionString = fs.readFileSync(SESSION_FILE, 'utf8').trim();
+      } catch {}
     }
+    if (!sessionString) {
+      sessionString = DEFAULT_VERIFIED_SESSION;
+    }
+
+    const session = new StringSession(sessionString);
+    session.setDC(2, '149.154.167.41', 443);
+
     client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
       connectionRetries: 5,
       autoReconnect: true,
       floodSleepThreshold: 60,
     });
 
-    await client.start({ botAuthToken: TG_BOT_TOKEN });
+    await client.connect();
+
+    const isAuthorized = await client.checkAuthorization().catch(() => false);
+    if (!isAuthorized) {
+      console.log('🔄 Telegram bot avtorizatsiyadan o\'tmoqda...');
+      await client.start({ botAuthToken: TG_BOT_TOKEN });
+      const newSess = client.session.save();
+      try {
+        fs.writeFileSync(SESSION_FILE, newSess);
+      } catch {}
+    }
+
     const me = await client.getMe();
     console.log(`🤖 [Telegram Bot] Muvaffaqiyatli ulandi: @${me.username}`);
 
     registerTelegramEventHandler(client);
     return client;
   } catch (err) {
-    console.error('❌ [Telegram Bot] Ulanishda xatolik:', err);
+    console.error('❌ [Telegram Bot] Ulanishda xatolik:', err?.message || err);
     throw err;
   } finally {
     isInitializing = false;
@@ -268,19 +433,32 @@ function registerTelegramEventHandler(tgClient) {
       const message = event.message;
       if (!message) return;
 
-      const mediaInfo = extractMediaFromMessage(message);
-      if (!mediaInfo) return;
-
+      const chat = message.chat || event.chat;
       const cleanChannelId = String(message.chatId || message.peerId?.channelId || '')
         .replace(/^-100/, '')
         .replace(/^-/, '');
       const messageId = message.id;
+
+      // Agar chat mavjud bo'lsa va uning accessHash bor bo'lsa, saqlab qo'yamiz
+      if (cleanChannelId && chat && chat.accessHash) {
+        knownChannels.set(cleanChannelId, {
+          channelId: cleanChannelId,
+          accessHash: chat.accessHash.toString(),
+          title: chat.title || ''
+        });
+        savePersistedChannels();
+      }
+
+      const mediaInfo = extractMediaFromMessage(message);
+      if (!mediaInfo) return;
+
       const cacheKey = `${cleanChannelId}_${messageId}`;
-
       mediaMetaCache.set(cacheKey, mediaInfo);
+      savePersistedMetadata();
 
-      const mp4Url = `https://${TG_STREAM_DOMAIN}/api/tgstream/${cleanChannelId}/${messageId}`;
       const hlsUrl = `https://${TG_STREAM_DOMAIN}/api/tghls/${cleanChannelId}/${messageId}/master.m3u8`;
+      const playerUrl = `https://${TG_STREAM_DOMAIN}/player/${cleanChannelId}/${messageId}`;
+      const mp4Url = `https://${TG_STREAM_DOMAIN}/api/tgstream/${cleanChannelId}/${messageId}`;
 
       let codecInfo = `🎞 <b>Format:</b> <code>H.264 (AVC)</code> ✅ <i>(Brauzerlarga 100% mos)</i>\n\n`;
       let warningBlock = '';
@@ -289,8 +467,8 @@ function registerTelegramEventHandler(tgClient) {
         codecInfo = `🎞 <b>Format:</b> <code>HEVC (H.265 / x265)</code> ⚠️\n\n`;
         warningBlock = 
           `⚠️ <b>DIQQAT (Format Ogohlantirishi):</b>\n` +
-          `Ushbu video <b>HEVC (H.265)</b> formatida! Brauzerlar (ayniqsa kompyuterdagi Chrome/Firefox) H.265 kodeki litsenziyasi yo'qligi sababli bu videoni <b>faqat audio</b> qilib ochadi.\n` +
-          `💡 <i>Saytda barcha foydalanuvchilarda video to'liq va qotmasdan ochilishi uchun videolarni <b>H.264 (x264 / AVC)</b> formatida yuklang!</i>\n\n`;
+          `Ushbu video <b>HEVC (H.265)</b> formatida! Brauzerlar (ayniqsa kompyuterlarda) bu videoni <b>faqat audio</b> qilib ochishi mumkin.\n` +
+          `💡 <i>Saytda barcha foydalanuvchilarda video to'liq ochilishi uchun videolarni <b>H.264 (x264 / AVC)</b> formatida yuklang!</i>\n\n`;
       }
 
       const replyHtml = 
@@ -300,14 +478,14 @@ function registerTelegramEventHandler(tgClient) {
         `⏱ <b>Davomiyligi:</b> ${formatDuration(mediaInfo.duration)}\n` +
         codecInfo +
         warningBlock +
-        `⚡️ <b>1. HLS Stream URL (YouTube Tezligida & 10,000+ kishiga):</b>\n` +
+        `⚡️ <b>1. HLS Stream Havolasi (Sayt va Pleyer uchun eng tezkori):</b>\n` +
         `<code>${hlsUrl}</code>\n\n` +
-        `🔗 <b>2. To'g'ridan-to'g'ri MP4 URL (Direct MP4 Stream):</b>\n` +
+        `▶️ <b>2. Onlayn Pleyer (Brauzerda to'g'ridan-to'g'ri ko'rish):</b>\n` +
+        `<code>${playerUrl}</code>\n\n` +
+        `🔗 <b>3. To'g'ridan-to'g'ri MP4 URL (Zaxira oqim):</b>\n` +
         `<code>${mp4Url}</code>\n\n` +
-        `▶️ <b>3. Onlayn Pleyer (Brauzerda to'g'ridan-to'g'ri ko'rish):</b>\n` +
-        `<code>https://${TG_STREAM_DOMAIN}/player/${cleanChannelId}/${messageId}</code>\n\n` +
         `🛡 <b>Xavfsizlik:</b> Faqat Animem.uz saytida va rasmiy brauzer pleyerida ishlaydi.\n\n` +
-        `💡 <i>Sayt Admin panelidagi qism "video_url" maydoniga <b>HLS (.m3u8)</b> havolasini qo'yish tavsiya etiladi. 10,000 odam bir vaqtda kirganda ham video qotmasdan, YouTube kabi bir zumda ochiladi!</i>`;
+        `💡 <i>Sayt Admin panelidagi "video_url" maydoniga <b>HLS (.m3u8)</b> havolasini qo'ying. Video hech qanday qotishlarsiz, YouTube kabi bir zumda ochiladi va oxirigacha to'liq o'ynaydi!</i>`;
 
       await tgClient.sendMessage(message.chatId, {
         message: replyHtml,
@@ -315,9 +493,9 @@ function registerTelegramEventHandler(tgClient) {
         replyTo: messageId
       });
 
-      console.log(`[Telegram Streamer] Replied with stream URLs for message #${messageId} in channel ${cleanChannelId}`);
+      console.log(`[Telegram Streamer] Replied with HLS stream URLs for message #${messageId} in channel ${cleanChannelId}`);
 
-      // Kanalga video tashlangan zahoti orqa fonda HLS ga bo'lib tayyorlashni boshlash!
+      // Kanalga video tashlangan zahoti orqa fonda darhol HLS ga bo'lib tayyorlashni boshlash!
       ensureVideoProcessing(cleanChannelId, messageId).catch(err => {
         console.warn(`[HLS Streamer] Auto pre-processing note (${cleanChannelId}/${messageId}):`, err?.message || err);
       });
@@ -332,7 +510,7 @@ async function getStreamMetadata(channelId, messageId) {
   const cacheKey = `${cleanId}_${messageId}`;
 
   const cached = mediaMetaCache.get(cacheKey);
-  if (cached && (Date.now() - cached.cachedAt < 3600000)) {
+  if (cached && (Date.now() - cached.cachedAt < 86400000)) { // 24 soatlik xotira
     return cached;
   }
 
@@ -343,10 +521,18 @@ async function getStreamMetadata(channelId, messageId) {
 
   try {
     let peer;
-    try {
-      peer = await tgClient.getInputEntity(normalizedChannelId);
-    } catch {
-      peer = await tgClient.getEntity(normalizedChannelId);
+    const ch = knownChannels.get(cleanId);
+    if (ch && ch.accessHash) {
+      peer = new Api.InputPeerChannel({
+        channelId: bigInt(ch.channelId),
+        accessHash: bigInt(ch.accessHash),
+      });
+    } else {
+      try {
+        peer = await tgClient.getInputEntity(normalizedChannelId);
+      } catch {
+        peer = await tgClient.getInputEntity(cleanId);
+      }
     }
 
     const messages = await tgClient.getMessages(peer, { ids: [messageId] });
@@ -356,6 +542,7 @@ async function getStreamMetadata(channelId, messageId) {
     if (!mediaInfo) return null;
 
     mediaMetaCache.set(cacheKey, mediaInfo);
+    savePersistedMetadata();
     return mediaInfo;
   } catch (err) {
     console.error(`[Telegram Streamer] Fetch message #${messageId} error:`, err?.message || err);
@@ -364,80 +551,201 @@ async function getStreamMetadata(channelId, messageId) {
 }
 
 // ============================================================================
-// HLS STREAMING VA ORQA FONDA SEGMENTATSIYA MOTORLARI
+// ASINXRON HLS SEGMENTATSIYA MOTORLARI (EVENT-LOOP QOTMAYDI)
 // ============================================================================
 
-function sliceSegmentSync(inputFile, videoFolder, segIdx, isHevc = false) {
+function sliceSegmentAsync(inputFile, videoFolder, segIdx, isHevc = false) {
   const targetSegFile = path.join(videoFolder, `segment_${segIdx}.ts`);
-  if (fs.existsSync(targetSegFile) && fs.statSync(targetSegFile).size > 1000) return true;
+  if (fs.existsSync(targetSegFile) && fs.statSync(targetSegFile).size > 1000) return Promise.resolve(true);
 
   const tempSegFile = path.join(videoFolder, `temp_seg_${segIdx}_${Date.now()}.ts`);
   const ffmpegBin = getFfmpegBinary();
   const startTime = segIdx * HLS_SEGMENT_DURATION;
   const bsfFilter = isHevc ? 'hevc_mp4toannexb' : 'h264_mp4toannexb';
 
-  // 1. Tezkor stream copy
-  const res = spawnSync(ffmpegBin, [
-    '-ss', String(startTime),
-    '-i', inputFile,
-    '-t', String(HLS_SEGMENT_DURATION),
-    '-c', 'copy',
-    '-bsf:v', bsfFilter,
-    '-avoid_negative_ts', 'make_zero',
-    '-fflags', '+genpts',
-    '-f', 'mpegts',
-    '-y',
-    tempSegFile
-  ], { timeout: 10000 });
+  return new Promise((resolve) => {
+    const ff = spawn(ffmpegBin, [
+      '-ss', String(startTime),
+      '-i', inputFile,
+      '-t', String(HLS_SEGMENT_DURATION),
+      '-c', 'copy',
+      '-bsf:v', bsfFilter,
+      '-avoid_negative_ts', 'make_zero',
+      '-fflags', '+genpts',
+      '-f', 'mpegts',
+      '-y',
+      tempSegFile
+    ]);
 
-  if (res.status === 0 && fs.existsSync(tempSegFile) && fs.statSync(tempSegFile).size > 1000) {
-    try {
-      fs.renameSync(tempSegFile, targetSegFile);
-      const buf = fs.readFileSync(targetSegFile);
-      const cacheKey = `${path.basename(videoFolder)}_seg_${segIdx}`;
-      hlsSegmentCache.set(cacheKey, buf);
-      return true;
-    } catch {
-      return false;
-    }
+    const timer = setTimeout(() => {
+      try { ff.kill('SIGKILL'); } catch {}
+      resolve(false);
+    }, 12000);
+
+    ff.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0 && fs.existsSync(tempSegFile) && fs.statSync(tempSegFile).size > 1000) {
+        try {
+          fs.renameSync(tempSegFile, targetSegFile);
+          const buf = fs.readFileSync(targetSegFile);
+          const cacheKey = `${path.basename(videoFolder)}_seg_${segIdx}`;
+          hlsSegmentCache.set(cacheKey, buf);
+          return resolve(true);
+        } catch {
+          return resolve(false);
+        }
+      }
+
+      // Fallback: AAC audiosiga o'tkazish
+      const fb = spawn(ffmpegBin, [
+        '-ss', String(startTime),
+        '-i', inputFile,
+        '-t', String(HLS_SEGMENT_DURATION),
+        '-c:v', 'copy',
+        '-bsf:v', bsfFilter,
+        '-c:a', 'aac',
+        '-avoid_negative_ts', 'make_zero',
+        '-fflags', '+genpts',
+        '-f', 'mpegts',
+        '-y',
+        tempSegFile
+      ]);
+
+      const fbTimer = setTimeout(() => {
+        try { fb.kill('SIGKILL'); } catch {}
+        resolve(false);
+      }, 15000);
+
+      fb.on('close', (fbCode) => {
+        clearTimeout(fbTimer);
+        if (fbCode === 0 && fs.existsSync(tempSegFile) && fs.statSync(tempSegFile).size > 1000) {
+          try {
+            fs.renameSync(tempSegFile, targetSegFile);
+            const buf = fs.readFileSync(targetSegFile);
+            const cacheKey = `${path.basename(videoFolder)}_seg_${segIdx}`;
+            hlsSegmentCache.set(cacheKey, buf);
+            return resolve(true);
+          } catch {}
+        }
+        if (fs.existsSync(tempSegFile)) {
+          try { fs.unlinkSync(tempSegFile); } catch {}
+        }
+        resolve(false);
+      });
+
+      fb.on('error', () => {
+        clearTimeout(fbTimer);
+        resolve(false);
+      });
+    });
+
+    ff.on('error', () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+function convertSourceToHlsAsync(sourceFile, videoFolder, indexFile, isHevc = false) {
+  const ffmpegBin = getFfmpegBinary();
+  const bsfFilter = isHevc ? 'hevc_mp4toannexb' : 'h264_mp4toannexb';
+
+  return new Promise((resolve) => {
+    const ff = spawn(ffmpegBin, [
+      '-i', sourceFile,
+      '-c', 'copy',
+      '-bsf:v', bsfFilter,
+      '-avoid_negative_ts', 'make_zero',
+      '-fflags', '+genpts',
+      '-f', 'hls',
+      '-hls_time', String(HLS_SEGMENT_DURATION),
+      '-hls_list_size', '0',
+      '-hls_flags', 'independent_segments',
+      '-hls_playlist_type', 'vod',
+      '-hls_segment_filename', path.join(videoFolder, 'segment_%d.ts'),
+      '-y',
+      indexFile
+    ]);
+
+    const timer = setTimeout(() => {
+      try { ff.kill('SIGKILL'); } catch {}
+      resolve(false);
+    }, 180000);
+
+    ff.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0 && fs.existsSync(indexFile)) {
+        return resolve(true);
+      }
+
+      // Fallback
+      const fb = spawn(ffmpegBin, [
+        '-i', sourceFile,
+        '-c:v', 'copy',
+        '-bsf:v', bsfFilter,
+        '-c:a', 'aac',
+        '-avoid_negative_ts', 'make_zero',
+        '-fflags', '+genpts',
+        '-f', 'hls',
+        '-hls_time', String(HLS_SEGMENT_DURATION),
+        '-hls_list_size', '0',
+        '-hls_flags', 'independent_segments',
+        '-hls_playlist_type', 'vod',
+        '-hls_segment_filename', path.join(videoFolder, 'segment_%d.ts'),
+        '-y',
+        indexFile
+      ]);
+
+      const fbTimer = setTimeout(() => {
+        try { fb.kill('SIGKILL'); } catch {}
+        resolve(false);
+      }, 240000);
+
+      fb.on('close', (fbCode) => {
+        clearTimeout(fbTimer);
+        resolve(fbCode === 0 && fs.existsSync(indexFile));
+      });
+
+      fb.on('error', () => {
+        clearTimeout(fbTimer);
+        resolve(false);
+      });
+    });
+
+    ff.on('error', () => {
+      clearTimeout(timer);
+      resolve(false);
+    });
+  });
+}
+
+// ============================================================================
+// HLS ISHLOV BERISH VA YUKLASH NAVBATI
+// ============================================================================
+const MAX_CONCURRENT_PROCESSING = 2; // Bir vaqtda 2 tagacha video yuklanadi
+let currentProcessingCount = 0;
+const processingQueue = [];
+
+function enqueueVideoTask(taskFn) {
+  if (currentProcessingCount < MAX_CONCURRENT_PROCESSING) {
+    currentProcessingCount++;
+    taskFn().finally(() => {
+      currentProcessingCount--;
+      if (processingQueue.length > 0) {
+        const nextTask = processingQueue.shift();
+        enqueueVideoTask(nextTask);
+      }
+    });
+  } else {
+    processingQueue.push(taskFn);
   }
-
-  // 2. Fallback: AAC audiosiga o'tkazish
-  const fb = spawnSync(ffmpegBin, [
-    '-ss', String(startTime),
-    '-i', inputFile,
-    '-t', String(HLS_SEGMENT_DURATION),
-    '-c:v', 'copy',
-    '-bsf:v', bsfFilter,
-    '-c:a', 'aac',
-    '-avoid_negative_ts', 'make_zero',
-    '-fflags', '+genpts',
-    '-f', 'mpegts',
-    '-y',
-    tempSegFile
-  ], { timeout: 15000 });
-
-  if (fb.status === 0 && fs.existsSync(tempSegFile) && fs.statSync(tempSegFile).size > 1000) {
-    try {
-      fs.renameSync(tempSegFile, targetSegFile);
-      const buf = fs.readFileSync(targetSegFile);
-      const cacheKey = `${path.basename(videoFolder)}_seg_${segIdx}`;
-      hlsSegmentCache.set(cacheKey, buf);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  if (fs.existsSync(tempSegFile)) {
-    try { fs.unlinkSync(tempSegFile); } catch {}
-  }
-  return false;
 }
 
 async function ensureVideoProcessing(channelId, messageId) {
   const cleanId = String(channelId).replace(/^-100/, '').replace(/^-/, '');
   const key = `${cleanId}_${messageId}`;
+  touchVideoAccess(key);
+
   const videoFolder = path.join(HLS_CACHE_DIR, key);
   const partFile = path.join(videoFolder, 'source.mp4.part');
   const sourceFile = path.join(videoFolder, 'source.mp4');
@@ -455,6 +763,7 @@ async function ensureVideoProcessing(channelId, messageId) {
 
   const emitter = new EventEmitter();
   emitter.setMaxListeners(200);
+  emitter.on('error', () => {});
 
   const state = {
     channelId: cleanId,
@@ -471,9 +780,12 @@ async function ensureVideoProcessing(channelId, messageId) {
 
   activeVideoDownloads.set(key, state);
 
-  // Orqa fonda yuklab olish va HLS ga o'tkazish
-  (async () => {
+  enqueueVideoTask(async () => {
+    let writeStream = null;
+    let downloadStream = null;
     try {
+      cleanDiskSpace();
+
       const tgClient = await getTelegramClient();
       const fileLocation = new Api.InputDocumentFileLocation({
         id: meta.document.id,
@@ -490,9 +802,9 @@ async function ensureVideoProcessing(channelId, messageId) {
       const remainingBytes = meta.size - startOffset;
       const chunkLimit = Math.ceil(remainingBytes / TG_CHUNK_SIZE);
 
-      const writeStream = fs.createWriteStream(partFile, { flags: startOffset > 0 ? 'a' : 'w' });
+      writeStream = fs.createWriteStream(partFile, { flags: startOffset > 0 ? 'a' : 'w' });
 
-      const downloadStream = tgClient.iterDownload({
+      downloadStream = tgClient.iterDownload({
         file: fileLocation,
         dcId: meta.document.dcId,
         offset: bigInt(startOffset),
@@ -507,20 +819,27 @@ async function ensureVideoProcessing(channelId, messageId) {
       for await (const chunk of downloadStream) {
         writeStream.write(chunk);
         state.bytesDownloaded += chunk.length;
+        touchVideoAccess(key);
         state.emitter.emit('progress', state.bytesDownloaded);
 
-        // Birinchi 3 MB tushgandayoq segment 0 ni kesib qo'yish (<1s tezkor start!)
-        if (!seg0Done && state.bytesDownloaded >= Math.min(meta.size, 3 * 1024 * 1024)) {
-          sliceSegmentSync(partFile, videoFolder, 0, meta.isHevc);
-          seg0Done = true;
-          state.emitter.emit('segment_ready', 0);
+        // Birinchi 2.5 MB tushgandayoq segment 0 ni kesib qo'yish (<1s tezkor start)
+        if (!seg0Done && state.bytesDownloaded >= Math.min(meta.size, 2.5 * 1024 * 1024)) {
+          sliceSegmentAsync(partFile, videoFolder, 0, meta.isHevc).then(ok => {
+            if (ok) {
+              seg0Done = true;
+              state.emitter.emit('segment_ready', 0);
+            }
+          });
         }
 
-        // 6 MB tushganda segment 1 ni kesib qo'yish
-        if (!seg1Done && state.bytesDownloaded >= Math.min(meta.size, 6 * 1024 * 1024)) {
-          sliceSegmentSync(partFile, videoFolder, 1, meta.isHevc);
-          seg1Done = true;
-          state.emitter.emit('segment_ready', 1);
+        // 5 MB tushganda segment 1 ni kesib qo'yish
+        if (!seg1Done && state.bytesDownloaded >= Math.min(meta.size, 5 * 1024 * 1024)) {
+          sliceSegmentAsync(partFile, videoFolder, 1, meta.isHevc).then(ok => {
+            if (ok) {
+              seg1Done = true;
+              state.emitter.emit('segment_ready', 1);
+            }
+          });
         }
       }
 
@@ -531,61 +850,33 @@ async function ensureVideoProcessing(channelId, messageId) {
         try { fs.renameSync(partFile, sourceFile); } catch {}
       }
 
-      // Butun videoni birdaniga to'liq HLS segmentlariga bo'lib chiqish (atigi 1-2 soniya)
-      const ffmpegBin = getFfmpegBinary();
-      const bsfFilter = meta.isHevc ? 'hevc_mp4toannexb' : 'h264_mp4toannexb';
-      const hlsRes = spawnSync(ffmpegBin, [
-        '-i', sourceFile,
-        '-c', 'copy',
-        '-bsf:v', bsfFilter,
-        '-avoid_negative_ts', 'make_zero',
-        '-fflags', '+genpts',
-        '-f', 'hls',
-        '-hls_time', String(HLS_SEGMENT_DURATION),
-        '-hls_list_size', '0',
-        '-hls_flags', 'independent_segments',
-        '-hls_playlist_type', 'vod',
-        '-hls_segment_filename', path.join(videoFolder, 'segment_%d.ts'),
-        '-y',
-        indexFile
-      ], { timeout: 90000 });
-
-      if (hlsRes.status !== 0) {
-        spawnSync(ffmpegBin, [
-          '-i', sourceFile,
-          '-c:v', 'copy',
-          '-bsf:v', bsfFilter,
-          '-c:a', 'aac',
-          '-avoid_negative_ts', 'make_zero',
-          '-fflags', '+genpts',
-          '-f', 'hls',
-          '-hls_time', String(HLS_SEGMENT_DURATION),
-          '-hls_list_size', '0',
-          '-hls_flags', 'independent_segments',
-          '-hls_playlist_type', 'vod',
-          '-hls_segment_filename', path.join(videoFolder, 'segment_%d.ts'),
-          '-y',
-          indexFile
-        ], { timeout: 120000 });
-      }
+      // Butun videoni birdaniga to'liq HLS segmentlariga bo'lib chiqish (asinxron, 1-2 soniya)
+      console.log(`[HLS Streamer] Converting full video to HLS VOD playlist (${key})...`);
+      const hlsOk = await convertSourceToHlsAsync(sourceFile, videoFolder, indexFile, meta.isHevc);
 
       state.isCompleted = true;
       state.emitter.emit('completed');
 
       // Segmentlar tayyor bo'lgach, diskni tejash uchun xom source.mp4 ni o'chirish
-      if (fs.existsSync(sourceFile) && fs.existsSync(indexFile)) {
+      if (hlsOk && fs.existsSync(sourceFile) && fs.existsSync(indexFile)) {
         try { fs.unlinkSync(sourceFile); } catch {}
       }
 
-      console.log(`✅ [HLS Streamer] Video to'liq segmentlarga bo'lindi (${key})!`);
+      console.log(`✅ [HLS Streamer] Video to'liq va muvaffaqiyatli HLS ga o'tkazildi (${key})!`);
     } catch (err) {
       console.warn(`[HLS Streamer] Background process error (${key}):`, err?.message || err);
       state.error = err?.message || String(err);
       state.emitter.emit('error', state.error);
     } finally {
+      if (writeStream && !writeStream.destroyed) {
+        try { writeStream.destroy(); } catch {}
+      }
+      if (typeof downloadStream?.return === 'function') {
+        try { await downloadStream.return(); } catch {}
+      }
       activeVideoDownloads.delete(key);
     }
-  })();
+  });
 
   return state;
 }
@@ -601,7 +892,7 @@ app.get(['/health', '/ping', '/'], (_req, res) => {
   res.status(200).send("Animem S3 Video Streamer is Running OK ✅");
 });
 
-// 1. Direct MP4 Stream Handler
+// 1. Direct MP4 Stream Handler (Range Requests)
 app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
   const { channelId, messageId } = req.params;
   const numMsgId = parseInt(messageId, 10);
@@ -616,6 +907,7 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
 
   const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
   const cacheKey = `${cleanId}_${numMsgId}`;
+  touchVideoAccess(cacheKey);
   const headKey = `${cacheKey}_head`;
 
   try {
@@ -652,10 +944,12 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     }
 
     if (start >= totalSize || end >= totalSize || start > end) {
-      return res.status(416).setHeader('Content-Range', `bytes */${totalSize}`).end();
+      res.status(416).setHeader('Content-Range', `bytes */${totalSize}`).end();
+      return;
     }
 
     const chunkSize = end - start + 1;
+
     if (isRange) {
       res.status(206);
       res.setHeader('Content-Range', `bytes ${start}-${end}/${totalSize}`);
@@ -666,16 +960,13 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     res.setHeader('Content-Length', chunkSize);
     res.setHeader('Content-Type', mimeType);
 
-    if (req.method === 'HEAD') {
-      return res.end();
-    }
+    if (req.method === 'HEAD') return res.end();
 
-    // Fast-start: RAM keshi (birinchi 4 MB)
-    const HEAD_BUFFER_SIZE = 4 * 1024 * 1024;
-    if (start < HEAD_BUFFER_SIZE && videoHeadCache.has(headKey)) {
+    const HEAD_BUFFER_SIZE = 2 * 1024 * 1024;
+    if (start === 0 && videoHeadCache.has(headKey)) {
       const cachedHead = videoHeadCache.get(headKey);
-      if (end < cachedHead.length) {
-        return res.end(cachedHead.subarray(start, end + 1));
+      if (chunkSize <= cachedHead.length) {
+        return res.end(cachedHead.subarray(0, chunkSize));
       }
     }
 
@@ -688,13 +979,10 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     });
 
     const TG_CHUNK_SIZE = 512 * 1024;
-    const TG_ALIGN = 4096;
-    const alignedStart = Math.floor(start / TG_ALIGN) * TG_ALIGN;
+    const alignedStart = Math.floor(start / TG_CHUNK_SIZE) * TG_CHUNK_SIZE;
     const skipBytes = start - alignedStart;
-    const chunkLimit = Math.ceil((chunkSize + skipBytes) / TG_CHUNK_SIZE);
-
-    let isAborted = false;
-    req.on('close', () => { isAborted = true; });
+    const totalBytesToFetch = (end - start + 1) + skipBytes;
+    const chunkLimit = Math.ceil(totalBytesToFetch / TG_CHUNK_SIZE);
 
     const downloadStream = tgClient.iterDownload({
       file: fileLocation,
@@ -707,33 +995,43 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
 
     let bytesRemaining = chunkSize;
     let skipped = 0;
+    let isAborted = false;
+
+    req.on('close', () => { isAborted = true; });
+
     const headChunks = [];
     let headBytes = 0;
 
-    for await (const chunk of downloadStream) {
-      if (isAborted || res.writableEnded || res.destroyed) break;
+    try {
+      for await (const chunk of downloadStream) {
+        if (isAborted || res.writableEnded || res.destroyed) break;
 
-      let dataChunk = chunk;
-      if (skipped < skipBytes) {
-        const toSkip = Math.min(skipBytes - skipped, dataChunk.length);
-        dataChunk = dataChunk.subarray(toSkip);
-        skipped += toSkip;
+        let dataChunk = chunk;
+        if (skipped < skipBytes) {
+          const toSkip = Math.min(skipBytes - skipped, dataChunk.length);
+          dataChunk = dataChunk.subarray(toSkip);
+          skipped += toSkip;
+        }
+
+        if (dataChunk.length === 0) continue;
+
+        const bytesToSend = Math.min(dataChunk.length, bytesRemaining);
+        const slice = dataChunk.subarray(0, bytesToSend);
+        const ok = res.write(slice);
+        bytesRemaining -= bytesToSend;
+
+        if (start === 0 && headBytes < HEAD_BUFFER_SIZE) {
+          headChunks.push(slice);
+          headBytes += slice.length;
+        }
+
+        if (bytesRemaining <= 0) break;
+        if (!ok) await new Promise(resolve => res.once('drain', resolve));
       }
-
-      if (dataChunk.length === 0) continue;
-
-      const bytesToSend = Math.min(dataChunk.length, bytesRemaining);
-      const slice = dataChunk.subarray(0, bytesToSend);
-      const ok = res.write(slice);
-      bytesRemaining -= bytesToSend;
-
-      if (start === 0 && headBytes < HEAD_BUFFER_SIZE) {
-        headChunks.push(slice);
-        headBytes += slice.length;
+    } finally {
+      if (typeof downloadStream?.return === 'function') {
+        try { await downloadStream.return(); } catch {}
       }
-
-      if (bytesRemaining <= 0) break;
-      if (!ok) await new Promise(resolve => res.once('drain', resolve));
     }
 
     if (start === 0 && headChunks.length > 0 && !videoHeadCache.has(headKey)) {
@@ -1044,6 +1342,7 @@ app.get(['/api/tghls/:channelId/:messageId/master.m3u8', '/player/:channelId/:me
   }
 
   const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
+  touchVideoAccess(`${cleanId}_${numMsgId}`);
   const isHtmlRequest = req.headers.accept && req.headers.accept.includes('text/html') && !req.query.raw;
 
   // Agar brauzerda to'g'ridan-to'g'ri ochilsa, Hls.js pleyerini ko'rsatish
@@ -1074,7 +1373,7 @@ app.get(['/api/tghls/:channelId/:messageId/master.m3u8', '/player/:channelId/:me
   res.status(200).send(playlist);
 });
 
-// 3. HLS Media Playlist
+// 3. HLS Media Playlist (VOD Oxirigacha O'ynatish)
 app.get('/api/tghls/:channelId/:messageId/index.m3u8', async (req, res) => {
   const { channelId, messageId } = req.params;
   const numMsgId = parseInt(messageId, 10);
@@ -1088,12 +1387,15 @@ app.get('/api/tghls/:channelId/:messageId/index.m3u8', async (req, res) => {
   }
 
   const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
+  const key = `${cleanId}_${numMsgId}`;
+  touchVideoAccess(key);
+
   const isHtmlRequest = req.headers.accept && req.headers.accept.includes('text/html') && !req.query.raw;
   if (isHtmlRequest) {
     return res.redirect(`/api/tghls/${cleanId}/${numMsgId}/master.m3u8`);
   }
 
-  const videoFolder = path.join(HLS_CACHE_DIR, `${cleanId}_${numMsgId}`);
+  const videoFolder = path.join(HLS_CACHE_DIR, key);
   const indexFile = path.join(videoFolder, 'index.m3u8');
 
   ensureVideoProcessing(channelId, numMsgId).catch(() => {});
@@ -1142,7 +1444,7 @@ app.get('/api/tghls/:channelId/:messageId/index.m3u8', async (req, res) => {
   res.status(200).send(playlist);
 });
 
-// 4. HLS Segment Delivery
+// 4. HLS Segment Delivery (Fast non-blocking async with CDN caching)
 app.get('/api/tghls/:channelId/:messageId/segment_:segmentNum.ts', async (req, res) => {
   const { channelId, messageId, segmentNum } = req.params;
   const numMsgId = parseInt(messageId, 10);
@@ -1157,8 +1459,11 @@ app.get('/api/tghls/:channelId/:messageId/segment_:segmentNum.ts', async (req, r
   }
 
   const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
+  const key = `${cleanId}_${numMsgId}`;
+  touchVideoAccess(key);
+
   const cacheKey = `${cleanId}_${numMsgId}_seg_${numSeg}`;
-  const videoFolder = path.join(HLS_CACHE_DIR, `${cleanId}_${numMsgId}`);
+  const videoFolder = path.join(HLS_CACHE_DIR, key);
   const segmentFilePath = path.join(videoFolder, `segment_${numSeg}.ts`);
 
   const origin = req.headers.origin;
@@ -1166,7 +1471,7 @@ app.get('/api/tghls/:channelId/:messageId/segment_:segmentNum.ts', async (req, r
   res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Range');
   res.setHeader('Content-Type', 'video/MP2T');
-  res.setHeader('Cache-Control', 'public, max-age=2592000, immutable'); // 30 kunlik CDN kesh
+  res.setHeader('Cache-Control', 'public, max-age=2592000, immutable'); // 30 kunlik Cloudflare CDN kesh
 
   if (req.method === 'HEAD') return res.end();
 
@@ -1191,7 +1496,7 @@ app.get('/api/tghls/:channelId/:messageId/segment_:segmentNum.ts', async (req, r
     } catch {}
   }
 
-  // 3. Orqa fonda yuklash va kesishni tekshirish
+  // 3. Orqa fonda yuklash va asinxron kesishni tekshirish
   const state = await ensureVideoProcessing(channelId, numMsgId);
 
   const partFile = path.join(videoFolder, 'source.mp4.part');
@@ -1200,7 +1505,7 @@ app.get('/api/tghls/:channelId/:messageId/segment_:segmentNum.ts', async (req, r
 
   if (availableInput) {
     const meta = await getStreamMetadata(channelId, numMsgId);
-    const ok = sliceSegmentSync(availableInput, videoFolder, numSeg, meta?.isHevc);
+    const ok = await sliceSegmentAsync(availableInput, videoFolder, numSeg, meta?.isHevc);
     if (ok && fs.existsSync(segmentFilePath) && fs.statSync(segmentFilePath).size > 1000) {
       const data = await fs.promises.readFile(segmentFilePath);
       hlsSegmentCache.set(cacheKey, data);
@@ -1209,30 +1514,35 @@ app.get('/api/tghls/:channelId/:messageId/segment_:segmentNum.ts', async (req, r
     }
   }
 
-  // 4. Agar hali yetib kelmagan bo'lsa, yuklash oqimini kutish (maksimum 8 soniya)
+  // 4. Agar hali yetib kelmagan bo'lsa, yuklash oqimini asinxron kutish (maksimum 12 soniya)
   if (state && !state.isCompleted) {
     const meta = await getStreamMetadata(channelId, numMsgId);
     await new Promise((resolve) => {
-      const timer = setTimeout(resolve, 8000);
-      const onProgress = () => {
-        const currentInput = fs.existsSync(sourceFile) ? sourceFile : (fs.existsSync(partFile) ? partFile : null);
-        if (currentInput) {
-          if (sliceSegmentSync(currentInput, videoFolder, numSeg, meta?.isHevc)) {
-            clearTimeout(timer);
-            state.emitter.off('progress', onProgress);
-            state.emitter.off('completed', onCompleted);
-            resolve();
-          }
-        }
-      };
-      const onCompleted = () => {
+      let resolved = false;
+      const cleanup = () => {
+        if (resolved) return;
+        resolved = true;
         clearTimeout(timer);
         state.emitter.off('progress', onProgress);
         state.emitter.off('completed', onCompleted);
+        state.emitter.off('error', onError);
         resolve();
       };
+
+      const timer = setTimeout(cleanup, 12000);
+      const onProgress = async () => {
+        const currentInput = fs.existsSync(sourceFile) ? sourceFile : (fs.existsSync(partFile) ? partFile : null);
+        if (currentInput) {
+          const ok = await sliceSegmentAsync(currentInput, videoFolder, numSeg, meta?.isHevc);
+          if (ok) cleanup();
+        }
+      };
+      const onCompleted = () => { cleanup(); };
+      const onError = () => { cleanup(); };
+
       state.emitter.on('progress', onProgress);
       state.emitter.on('completed', onCompleted);
+      state.emitter.on('error', onError);
     });
   }
 
