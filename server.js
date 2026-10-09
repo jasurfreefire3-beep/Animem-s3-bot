@@ -420,6 +420,7 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     res.setHeader('Accept-Ranges', 'bytes');
     res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
     res.setHeader('Content-Type', mimeType);
+    res.setHeader('Content-Disposition', 'inline');
 
     if (req.method === 'OPTIONS') {
       return res.sendStatus(204);
@@ -564,21 +565,22 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
   }
 });
 
-// 2. EMBED PLAYER (Sayt ichiga iframe orqali qo'yish uchun yengil va tezkor)
-app.get('/embed/:channelId/:messageId', (req, res) => {
+// 2. EMBED & NATIVE BROWSER PLAYER (To'g'ridan-to'g'ri brauzerda o'ta tezkor o'ynatish)
+app.get(['/player/:channelId/:messageId', '/embed/:channelId/:messageId'], (req, res) => {
   const { channelId, messageId } = req.params;
   const mp4Url = `/api/tgstream/${channelId}/${messageId}`;
 
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(`<!DOCTYPE html>
 <html lang="uz">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Animem Video</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Animem Video Stream</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
-    video { width: 100%; height: 100%; object-fit: contain; }
+    html, body { width: 100%; height: 100%; background: #050508; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+    video { width: 100%; height: 100%; max-height: 100vh; object-fit: contain; outline: none; }
   </style>
 </head>
 <body>
@@ -587,13 +589,33 @@ app.get('/embed/:channelId/:messageId', (req, res) => {
 </html>`);
 });
 
-// 3. BACKWARD-COMPATIBILITY REDIRECTS (Eski HLS va Player havolalarini avtomatik to'g'ri MP4 ga o'tkazish)
-app.get([
-  '/api/tghls/:channelId/:messageId/*',
-  '/player/:channelId/:messageId'
-], (req, res) => {
+// 3. ULTRA-FAST HLS & BACKWARD COMPATIBILITY
+app.get(['/api/tghls/:channelId/:messageId', '/api/tghls/:channelId/:messageId/*'], (req, res) => {
   const { channelId, messageId } = req.params;
   const mp4Url = `/api/tgstream/${channelId}/${messageId}`;
+  const target = req.url.toLowerCase();
+
+  // Agar mijoz yoki player HLS manifest (.m3u8) so'rasa, darhol to'g'ri manifest qaytaramiz
+  if (target.endsWith('.m3u8') || target.includes('.m3u8')) {
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    return res.send(`#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:7200
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:1440.0,
+${mp4Url}
+#EXT-X-ENDLIST`);
+  }
+
+  // Agar brauzerda ochilgan bo'lsa, to'g'ridan-to'g'ri player sahifasiga yo'naltiramiz
+  if (req.headers.accept && req.headers.accept.includes('text/html')) {
+    return res.redirect(302, `/player/${channelId}/${messageId}`);
+  }
+
+  // Boshqa barcha holatlarda to'g'ridan-to'g'ri MP4 oqimiga yo'naltirish
   return res.redirect(302, mp4Url);
 });
 
