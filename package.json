@@ -4,7 +4,7 @@
   "description": "Telegram Video HLS & Direct MP4 Ultra-Fast Streaming Bot Server for Animem.uz",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
+    "start": "node --expose-gc --max-old-space-size=256 server.js",
     "dev": "node --watch server.js"
   },
   "keywords": [

@@ -2,24 +2,22 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# Install FFmpeg for video HLS transmuxing
-RUN apk add --no-cache ffmpeg
+# Kuchsiz konteynerlar (Northflank Micro/Free tier) uchun xotira va GC sozlamalari
+ENV NODE_ENV=production
+ENV PORT=3000
+ENV NODE_OPTIONS="--max-old-space-size=256 --expose-gc"
 
-# Copy package descriptors
+# Faqat ishlab chiqarish (production) paketlarini o'rnatish
 COPY package*.json ./
+RUN npm install --omit=dev --no-audit --no-fund
 
-# Install production dependencies
-RUN npm install --production
-
-# Copy application files
+# Loyiha fayllarini nusxalash (.dockerignore orqali ortiqcha fayllar filtrlanadi)
 COPY . .
 
-# Create cache directory
+# Kesh jildini yaratish
 RUN mkdir -p /app/cache
 
 EXPOSE 3000
 
-ENV PORT=3000
-ENV NODE_ENV=production
-
-CMD ["node", "server.js"]
+# V8 xotira cheklovini yoqish orqali OOM (Out Of Memory) xatoligining oldi olinadi
+CMD ["node", "--expose-gc", "--max-old-space-size=256", "server.js"]

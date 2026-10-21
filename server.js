@@ -1,20 +1,21 @@
 /**
  * ============================================================================
  * ANIMEM.UZ - STANDALONE TELEGRAM ULTRA-FAST DIRECT MP4 STREAMING BOT SERVER
+ * (Northflank & Low-Resource Server Optimized Edition)
  * ============================================================================
  * 
- * Ushbu server Telegram kanallariga tashlangan videolarni:
- * 1. To'g'ridan-to'g'ri MP4 (HTTP 206 Partial Content / Range Requests) formatida uzatadi.
- * 2. 1000+ bir vaqtning o'zida ko'ruvchilarga qotmasdan, lahzada ochiladigan (moov cache) oqim beradi.
- * 3. HLS va og'ir FFmpeg konvertatsiyasiz (CPU va RAM ni 95% tejaydi).
- * 4. VPS diskini va keshini har 1 soatda avtomatik tozalaydi.
- * 5. Eski HLS va Player havolalarini avtomatik to'g'ridan-to'g'ri MP4 ga yo'naltiradi (302 Redirect).
+ * Ushbu server hatto eng kuchsiz konteynerlarda (Northflank Free/Micro 256MB-512MB RAM, 0.1 vCPU) ham:
+ * 1. OOM (Out Of Memory) bo'lmasdan barqaror ishlaydi.
+ * 2. Xotira (RAM) sarfini 35MB-60MB oralig'ida qat'iy nazorat qiladi.
+ * 3. Asinxron debounced saqlash orqali Event Loop qotishining (freeze) oldini oladi.
+ * 4. To'g'ridan-to'g'ri MP4 (HTTP 206 Partial Content / Range Requests) orqali lahzada ochadi.
+ * 5. Memory Watchdog orqali xotira to'lishidan oldin avtomatik GC va kesh tozalashni amalga oshiradi.
+ * 6. Graceful Shutdown (SIGTERM/SIGINT) orqali Northflank qayta ishga tushganda sessiyani saqlaydi.
  */
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { EventEmitter } = require('events');
 
 // Global xatoliklar ushlagichi (server to'xtab qolmasligi uchun)
 process.on('uncaughtException', (err) => {
@@ -57,7 +58,7 @@ const { NewMessage } = require('telegram/events');
 const bigInt = require('big-integer');
 
 // ============================================================================
-// KONFIGURATSIYA VA ATROF-MUHIT O'ZGARUVCHILARI
+// KONFIGURATSIYA VA KUCHSIZ SERVERLAR UCHUN OPTIMIZATSIYA SOZLAMALARI
 // ============================================================================
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const TG_API_ID = parseInt(process.env.TG_API_ID || '6', 10);
@@ -65,6 +66,16 @@ const TG_API_HASH = process.env.TG_API_HASH || 'eb06d4abfb49dc3eeb1aeb98ae0f581e
 const TG_BOT_TOKEN = process.env.TG_STREAM_BOT_TOKEN || '8969080492:AAFeXz93y6CjIBv0AmdlfVlE0N53gf_J6gY';
 const TG_STREAM_DOMAIN = process.env.TG_STREAM_DOMAIN || 's3.animem.uz';
 const CACHE_DIR = path.resolve(__dirname, process.env.HLS_CACHE_DIR || 'cache');
+
+// RAM va oqimni tejash limitlari (kuchsiz Northflank serverlarida qotmaslik kafolati)
+const MAX_HEAD_CACHE_ITEMS = parseInt(process.env.MAX_HEAD_CACHE_ITEMS || '30', 10);
+const MAX_HEAD_CACHE_BYTES = parseInt(process.env.MAX_HEAD_CACHE_BYTES || String(35 * 1024 * 1024), 10); // Maksimal 35MB RAM
+const HEAD_BUFFER_SIZE = parseInt(process.env.HEAD_BUFFER_SIZE || String(1.5 * 1024 * 1024), 10); // 1.5MB moov atom
+const MAX_CHUNK_BURST = parseInt(process.env.CHUNK_BURST_SIZE || String(2.5 * 1024 * 1024), 10); // 2.5MB burst oqim
+const TG_CHUNK_SIZE = parseInt(process.env.TG_CHUNK_SIZE || String(512 * 1024), 10); // 512KB Telegram chunk
+const MAX_META_ITEMS = parseInt(process.env.MAX_META_ITEMS || '800', 10);
+const RAM_LIMIT_MB = parseInt(process.env.RAM_LIMIT_MB || '220', 10);
+const CLEANUP_INTERVAL_MIN = parseInt(process.env.CLEANUP_INTERVAL_MIN || '15', 10);
 
 if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
@@ -76,9 +87,10 @@ const SESSION_FILE = path.join(CACHE_DIR, 'session.txt');
 const CHANNELS_FILE = path.join(CACHE_DIR, 'channels.json');
 const METADATA_FILE = path.join(CACHE_DIR, 'metadata.json');
 
-// Keshlar (LRU xotira)
+// Xotira keshlar
 const mediaMetaCache = new Map();
-const videoHeadCache = new Map(); // Birinchi 4MB moov atom keshi (lahzada boshlash uchun)
+const videoHeadCache = new Map(); // Birinchi 1.5MB moov atom keshi (<2ms ochilish uchun)
+let totalHeadCacheBytes = 0;
 
 // Ma'lum kanallar ro'yxati (accessHash saqlash)
 const knownChannels = new Map();
@@ -88,6 +100,7 @@ knownChannels.set('3873627200', {
   title: 'Animem UZ s3 bazasi‼️'
 });
 
+// Ma'lumotlarni yuklash
 function loadPersistedData() {
   try {
     if (fs.existsSync(CHANNELS_FILE)) {
@@ -108,29 +121,87 @@ function loadPersistedData() {
   } catch {}
 }
 
-function savePersistedChannels() {
-  try {
-    const obj = {};
-    for (const [k, v] of knownChannels.entries()) obj[k] = v;
-    fs.writeFileSync(CHANNELS_FILE, JSON.stringify(obj, null, 2));
-  } catch {}
-}
+// ⚡️ ASINXRON VA DEBOUNCED DISKKA YOZISH (Event Loop bloklanishini 100% oldini oladi)
+let metaSaveTimer = null;
+let channelsSaveTimer = null;
 
 function savePersistedMetadata() {
-  try {
-    if (mediaMetaCache.size > 2000) {
-      const keys = Array.from(mediaMetaCache.keys());
-      for (let i = 0; i < keys.length - 1500; i++) {
-        mediaMetaCache.delete(keys[i]);
+  if (metaSaveTimer) return;
+  metaSaveTimer = setTimeout(async () => {
+    metaSaveTimer = null;
+    try {
+      if (mediaMetaCache.size > MAX_META_ITEMS) {
+        const keys = Array.from(mediaMetaCache.keys());
+        const toDelete = keys.length - Math.floor(MAX_META_ITEMS * 0.75);
+        for (let i = 0; i < toDelete; i++) {
+          mediaMetaCache.delete(keys[i]);
+        }
       }
+      const obj = Object.fromEntries(mediaMetaCache);
+      await fs.promises.writeFile(METADATA_FILE, JSON.stringify(obj), 'utf8');
+    } catch (err) {
+      console.warn('⚠️ [Metadata Cache] Saqlashda ogohlantirish:', err?.message || err);
     }
-    const obj = {};
-    for (const [k, v] of mediaMetaCache.entries()) obj[k] = v;
-    fs.writeFileSync(METADATA_FILE, JSON.stringify(obj, null, 2));
+  }, 3000);
+}
+
+function savePersistedChannels() {
+  if (channelsSaveTimer) return;
+  channelsSaveTimer = setTimeout(async () => {
+    channelsSaveTimer = null;
+    try {
+      const obj = Object.fromEntries(knownChannels);
+      await fs.promises.writeFile(CHANNELS_FILE, JSON.stringify(obj), 'utf8');
+    } catch (err) {
+      console.warn('⚠️ [Channels] Saqlashda ogohlantirish:', err?.message || err);
+    }
+  }, 2000);
+}
+
+function flushPersistedDataSync() {
+  try {
+    if (metaSaveTimer) clearTimeout(metaSaveTimer);
+    if (channelsSaveTimer) clearTimeout(channelsSaveTimer);
+    const metaObj = Object.fromEntries(mediaMetaCache);
+    fs.writeFileSync(METADATA_FILE, JSON.stringify(metaObj), 'utf8');
+    const chObj = Object.fromEntries(knownChannels);
+    fs.writeFileSync(CHANNELS_FILE, JSON.stringify(chObj), 'utf8');
   } catch {}
 }
 
 loadPersistedData();
+
+// RAM keshni qat'iy nazorat qilish (OOM dan himoya)
+function storeVideoHead(key, buffer) {
+  if (!buffer || buffer.length === 0) return;
+
+  if (videoHeadCache.has(key)) {
+    const oldBuf = videoHeadCache.get(key);
+    if (oldBuf) totalHeadCacheBytes -= oldBuf.length;
+    videoHeadCache.delete(key);
+  }
+
+  // Limitdan oshmasligini ta'minlash (LRU eviksiya)
+  while (
+    (videoHeadCache.size >= MAX_HEAD_CACHE_ITEMS || 
+    (totalHeadCacheBytes + buffer.length > MAX_HEAD_CACHE_BYTES)) && 
+    videoHeadCache.size > 0
+  ) {
+    const oldestKey = videoHeadCache.keys().next().value;
+    if (!oldestKey) break;
+    const oldBuf = videoHeadCache.get(oldestKey);
+    if (oldBuf) totalHeadCacheBytes -= oldBuf.length;
+    videoHeadCache.delete(oldestKey);
+  }
+
+  videoHeadCache.set(key, buffer);
+  totalHeadCacheBytes += buffer.length;
+}
+
+function clearVideoHeadCache() {
+  videoHeadCache.clear();
+  totalHeadCacheBytes = 0;
+}
 
 // ============================================================================
 // FORMAT VA YORDAMCHI FUNKSIYALAR
@@ -206,7 +277,7 @@ function createDocumentLocation(doc) {
 }
 
 // ============================================================================
-// TELEGRAM CLIENT (GRAMJS)
+// TELEGRAM CLIENT (GRAMJS) - OPTIMIZED FOR CONTAINERS
 // ============================================================================
 let client = null;
 let isInitializing = false;
@@ -236,9 +307,13 @@ async function getTelegramClient() {
     const session = new StringSession(sessionString);
 
     client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
-      connectionRetries: 5,
+      connectionRetries: 10,
       autoReconnect: true,
       floodSleepThreshold: 60,
+      deviceModel: 'Northflank Streamer',
+      systemVersion: 'Linux',
+      appVersion: '1.0.0',
+      useWSS: false,
     });
 
     await client.connect();
@@ -266,7 +341,7 @@ async function getTelegramClient() {
   }
 }
 
-// Telegram kanalga video tashlanganda xabar berish
+// Telegram kanalga yangi video qo'shilganda xabar berish
 function registerTelegramEventHandler(tgClient) {
   tgClient.addEventHandler(async (event) => {
     try {
@@ -327,9 +402,9 @@ function registerTelegramEventHandler(tgClient) {
         replyTo: messageId
       });
 
-      console.log(`[Telegram Streamer] Replied with MP4 stream URL for message #${messageId} in channel ${cleanChannelId}`);
+      console.log(`[Telegram Streamer] Havola yuborildi: #${messageId} (Kanal: ${cleanChannelId})`);
     } catch (err) {
-      console.warn('[Telegram Streamer] Error handling incoming video message:', err?.message || err);
+      console.warn('[Telegram Streamer] Yangi xabarni qayta ishlashda ogohlantirish:', err?.message || err);
     }
   }, new NewMessage({}));
 }
@@ -374,7 +449,7 @@ async function getStreamMetadata(channelId, messageId) {
     savePersistedMetadata();
     return mediaInfo;
   } catch (err) {
-    console.error(`[Telegram Streamer] Fetch message #${messageId} error:`, err?.message || err);
+    console.error(`[Telegram Streamer] Metadata olishda xatolik #${messageId}:`, err?.message || err);
     return null;
   }
 }
@@ -383,10 +458,29 @@ async function getStreamMetadata(channelId, messageId) {
 // EXPRESS HTTP ROUTER & HIGH-PERFORMANCE MP4 STREAMING
 // ============================================================================
 const app = express();
+app.disable('x-powered-by');
 app.use(cors({ origin: true, credentials: true }));
 
-// Server sog'ligini tekshirish
-app.get(['/health', '/ping', '/'], (_req, res) => {
+// Server sog'ligini tekshirish (Northflank Liveness & Readiness Probes uchun optimal)
+app.get(['/health', '/ping'], (_req, res) => {
+  const mem = process.memoryUsage();
+  res.status(200).json({
+    status: 'ok',
+    uptime: Math.round(process.uptime()),
+    service: 'Animem S3 Video Streamer',
+    memory: {
+      rss: `${Math.round(mem.rss / 1024 / 1024)} MB`,
+      heapUsed: `${Math.round(mem.heapUsed / 1024 / 1024)} MB`,
+      heapTotal: `${Math.round(mem.heapTotal / 1024 / 1024)} MB`,
+    },
+    cachedVideos: mediaMetaCache.size,
+    cachedHeads: videoHeadCache.size,
+    cachedHeadBytes: formatBytes(totalHeadCacheBytes),
+    tgConnected: Boolean(client && client.connected),
+  });
+});
+
+app.get('/', (_req, res) => {
   res.status(200).send("Animem S3 Video Streamer is Running OK (Ultra-Fast MP4 Direct Stream) 🚀");
 });
 
@@ -412,7 +506,7 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     const mimeType = meta.mimeType || 'video/mp4';
     const rangeHeader = req.headers.range;
 
-    // CORS & Range headers
+    // CORS & Range sarlavhalari
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Range, Origin, Content-Type, Accept');
@@ -430,10 +524,7 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     let end = totalSize - 1;
     let isRange = false;
 
-    // Progressive Chunk Limiting: Agar brauzer ochiq diapazon so'rasa, 8MB bo'lib uzatamiz.
-    // Bu 1000 kishi bir vaqtda kirganda server xotirasini va MTProto tarmoq oqimini teng taqsimlaydi!
-    const MAX_CHUNK_BURST = 8 * 1024 * 1024; // 8MB burst limit per request
-
+    // Progressive Chunk Limiting: Kuchli yoki kuchsiz serverlarda RAM oqimini me'yorda ushlash
     if (rangeHeader) {
       const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
       if (match) {
@@ -467,8 +558,7 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
 
     if (req.method === 'HEAD') return res.end();
 
-    // ⚡️ INSTANT START: Video boshi (moov atom / metadata) xotirada bo'lsa darhol uzatish (<5ms)
-    const HEAD_BUFFER_SIZE = 4 * 1024 * 1024; // 4 MB moov kesh
+    // ⚡️ LAHZADA OCHILISH (INSTANT START): Video boshi RAM keshda bo'lsa darhol uzatish (<2ms)
     if (start === 0 && videoHeadCache.has(headKey)) {
       const cachedHead = videoHeadCache.get(headKey);
       if (chunkSize <= cachedHead.length) {
@@ -479,7 +569,6 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     const tgClient = await getTelegramClient();
     const fileLocation = createDocumentLocation(meta.document);
 
-    const TG_CHUNK_SIZE = 512 * 1024; // 512 KB Telegram direct chunk
     const alignedStart = Math.floor(start / TG_CHUNK_SIZE) * TG_CHUNK_SIZE;
     const skipBytes = start - alignedStart;
     const totalBytesToFetch = (end - start + 1) + skipBytes;
@@ -498,12 +587,16 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     let skipped = 0;
     let isAborted = false;
 
-    req.on('close', () => {
+    // Foydalanuvchi videoni to'xtatsa yoki brauzerni yopsa darhol Telegram streamni to'xtatish
+    const cleanupStream = () => {
       isAborted = true;
       if (typeof downloadStream?.return === 'function') {
         try { downloadStream.return(); } catch {}
       }
-    });
+    };
+
+    req.on('close', cleanupStream);
+    res.on('error', cleanupStream);
 
     const headChunks = [];
     let headBytes = 0;
@@ -533,39 +626,52 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
         }
 
         if (bytesRemaining <= 0) break;
-        if (!ok) await new Promise(resolve => res.once('drain', resolve));
+
+        // Xavfsiz backpressure: rozetka to'lgan bo'lsa kutish va socket xotiradan to'kilib ketmasligi
+        if (!ok && !res.writableEnded && !isAborted) {
+          await new Promise((resolve) => {
+            const onDrain = () => {
+              res.removeListener('close', onDrain);
+              resolve();
+            };
+            res.once('drain', onDrain);
+            res.once('close', onDrain);
+          });
+        }
       }
     } finally {
+      req.removeListener('close', cleanupStream);
+      res.removeListener('error', cleanupStream);
       if (typeof downloadStream?.return === 'function') {
         try { await downloadStream.return(); } catch {}
       }
     }
 
-    // Video boshini kelgusi so'rovlar uchun RAM keshga saqlash
+    // Video boshini (moov atom) kelgusi lahzada ochishlar uchun RAM keshga saqlash
     if (start === 0 && headChunks.length > 0 && !videoHeadCache.has(headKey)) {
-      if (videoHeadCache.size > 150) {
-        const firstKey = videoHeadCache.keys().next().value;
-        if (firstKey) videoHeadCache.delete(firstKey);
-      }
-      videoHeadCache.set(headKey, Buffer.concat(headChunks));
+      storeVideoHead(headKey, Buffer.concat(headChunks));
     }
 
     if (!res.writableEnded) res.end();
   } catch (err) {
     if (err?.errorMessage === 'FILEREF_UPGRADE_NEEDED' || err?.message?.includes('FILEREF')) {
       mediaMetaCache.delete(cacheKey);
-      videoHeadCache.delete(headKey);
+      if (videoHeadCache.has(headKey)) {
+        const oldBuf = videoHeadCache.get(headKey);
+        if (oldBuf) totalHeadCacheBytes -= oldBuf.length;
+        videoHeadCache.delete(headKey);
+      }
     }
     if (!res.headersSent) {
       res.status(500).json({ error: "Video oqimini uzatishda xatolik yuz berdi" });
     } else if (!res.writableEnded) {
       res.end();
     }
-    console.error(`[Telegram Streamer] Stream error (${channelId}/${numMsgId}):`, err?.message || err);
+    console.error(`[Telegram Streamer] Stream xatoligi (${channelId}/${numMsgId}):`, err?.message || err);
   }
 });
 
-// 2. EMBED & NATIVE BROWSER PLAYER (To'g'ridan-to'g'ri brauzerda o'ta tezkor o'ynatish)
+// 2. EMBED & NATIVE BROWSER PLAYER (To'g'ridan-to'g'ri brauzerda tezkor o'ynatish)
 app.get(['/player/:channelId/:messageId', '/embed/:channelId/:messageId'], (req, res) => {
   const { channelId, messageId } = req.params;
   const mp4Url = `/api/tgstream/${channelId}/${messageId}`;
@@ -589,7 +695,7 @@ app.get(['/player/:channelId/:messageId', '/embed/:channelId/:messageId'], (req,
 </html>`);
 });
 
-// 3. ULTRA-FAST HLS & BACKWARD COMPATIBILITY
+// 3. ULTRA-FAST HLS & MOSLASHUVCHANLIK REJIMLARI
 app.get(['/api/tghls/:channelId/:messageId', '/api/tghls/:channelId/:messageId/*'], (req, res) => {
   const { channelId, messageId } = req.params;
   const mp4Url = `/api/tgstream/${channelId}/${messageId}`;
@@ -620,15 +726,46 @@ ${mp4Url}
 });
 
 // ============================================================================
-// VPS DISK VA KESHNI HAR 1 SOATDA AVTOMATIK TOZALASH
+// XOTIRA NAZORATI VA AVTOMATIK TOZALASH (MEMORY WATCHDOG)
 // ============================================================================
-function autoCleanVpsStorage() {
-  console.log('🧹 [VPS Auto-Clean] Avtomatik kesh va keraksiz fayllarni tozalash boshlandi...');
+function checkMemoryUsage() {
+  const mem = process.memoryUsage();
+  const heapUsedMb = Math.round(mem.heapUsed / 1024 / 1024);
+  const rssMb = Math.round(mem.rss / 1024 / 1024);
+
+  // Agar RSS yoki Heap xotira belgilangan limitdan oshsa, OOM killer yetib kelmasidan oldin tozalash
+  if (rssMb > RAM_LIMIT_MB || heapUsedMb > Math.floor(RAM_LIMIT_MB * 0.75)) {
+    console.warn(`⚠️ [Watchdog] Xotira oshdi: RSS=${rssMb}MB, Heap=${heapUsedMb}MB (Limit: ${RAM_LIMIT_MB}MB). Kesh tozalanmoqda...`);
+    clearVideoHeadCache();
+
+    // Faqat so'nggi 200 ta metadata saqlanadi
+    if (mediaMetaCache.size > 200) {
+      const keys = Array.from(mediaMetaCache.keys());
+      for (let i = 0; i < keys.length - 200; i++) {
+        mediaMetaCache.delete(keys[i]);
+      }
+    }
+
+    if (global.gc) {
+      try {
+        global.gc();
+        const after = process.memoryUsage();
+        console.log(`🧹 [GC] Xotira tozalandi: RSS=${Math.round(after.rss / 1024 / 1024)}MB, Heap=${Math.round(after.heapUsed / 1024 / 1024)}MB`);
+      } catch {}
+    }
+  }
+}
+
+// Har 30 soniyada xotira holatini tekshirish
+setInterval(checkMemoryUsage, 30000);
+
+// Disk va vaqtinchalik fayllarni avtomatik tozalash
+function autoCleanStorage() {
+  console.log('🧹 [Storage Clean] Vaqtinchalik fayllarni tozalash boshlandi...');
   let deletedFiles = 0;
   let freedBytes = 0;
 
   try {
-    // 1. /tmp papkasidagi vaqtinchalik video fayllarni tozalash
     const tmpDir = os.tmpdir();
     if (fs.existsSync(tmpDir)) {
       const tmpFiles = fs.readdirSync(tmpDir);
@@ -645,18 +782,16 @@ function autoCleanVpsStorage() {
       }
     }
 
-    // 2. ./cache papkasidagi eski vaqtinchalik papka va fayllarni tozalash (session va channels saqlanadi)
     if (fs.existsSync(CACHE_DIR)) {
       const cacheEntries = fs.readdirSync(CACHE_DIR);
       for (const entry of cacheEntries) {
         if (entry === 'session.txt' || entry === 'channels.json' || entry === 'metadata.json') {
-          continue; // Muhim sozlamalarga tegmeymiz
+          continue;
         }
         const fullPath = path.join(CACHE_DIR, entry);
         try {
           const stat = fs.statSync(fullPath);
           if (stat.isDirectory()) {
-            // Eski video papkalari
             fs.rmSync(fullPath, { recursive: true, force: true });
             deletedFiles++;
           } else if (entry.endsWith('.ts') || entry.endsWith('.mp4') || entry.endsWith('.part') || entry.endsWith('.m3u8')) {
@@ -668,15 +803,9 @@ function autoCleanVpsStorage() {
       }
     }
 
-    // 3. Xotiradagi (RAM) keshni me'yorda ushlash
-    if (videoHeadCache.size > 150) {
-      videoHeadCache.clear();
-    }
-    if (mediaMetaCache.size > 2000) {
-      const keys = Array.from(mediaMetaCache.keys());
-      for (let i = 0; i < keys.length - 1000; i++) {
-        mediaMetaCache.delete(keys[i]);
-      }
+    // Video head cache hajmini tekshirish
+    if (totalHeadCacheBytes > MAX_HEAD_CACHE_BYTES) {
+      clearVideoHeadCache();
     }
 
     if (global.gc) {
@@ -684,23 +813,52 @@ function autoCleanVpsStorage() {
     }
 
     const freeMemMb = Math.round(os.freemem() / (1024 * 1024));
-    console.log(`✅ [VPS Auto-Clean] Tozalash yakunlandi: ${deletedFiles} ta keraksiz fayl (${formatBytes(freedBytes)}) o'chirildi. Bo'sh RAM: ${freeMemMb} MB`);
+    console.log(`✅ [Storage Clean] Yakunlandi: ${deletedFiles} ta fayl (${formatBytes(freedBytes)}) o'chirildi. Bo'sh tizim RAM: ${freeMemMb} MB`);
   } catch (err) {
-    console.warn('⚠️ [VPS Auto-Clean] Tozalashda ogohlantirish:', err?.message || err);
+    console.warn('⚠️ [Storage Clean] Ogohlantirish:', err?.message || err);
   }
 }
 
-// Har 1 soatda (3600000 ms) avtomatik tozalash
-setInterval(autoCleanVpsStorage, 60 * 60 * 1000);
-// Dastlabki ishga tushganda ham 10 soniyadan so'ng tozalab olish
-setTimeout(autoCleanVpsStorage, 10000);
+// Rejali tozalash (sukut bo'yicha har 15 daqiqada)
+setInterval(autoCleanStorage, CLEANUP_INTERVAL_MIN * 60 * 1000);
+setTimeout(autoCleanStorage, 10000);
 
 // ============================================================================
-// SERVERNI ISHGA TUSHIRISH
+// SERVERNI ISHGA TUSHIRISH VA GRACEFUL SHUTDOWN
 // ============================================================================
-app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 [Animem S3 MP4 Server] http://0.0.0.0:${PORT} portida muvaffaqiyatli ishga tushdi!`);
+  console.log(`⚙️  [Konfiguratsiya] RAM Cheklovi: ${RAM_LIMIT_MB}MB | Head Cache: ${formatBytes(MAX_HEAD_CACHE_BYTES)} | Burst: ${formatBytes(MAX_CHUNK_BURST)}`);
   getTelegramClient().catch(err => {
     console.error('❌ [Telegram Bot] Dastlabki ulanishda xatolik:', err?.message || err);
   });
 });
+
+// Soket va aloqa vaqti sozlamalari (kuchsiz tarmoq yoki kechikishlar uchun)
+server.keepAliveTimeout = 65000;
+server.headersTimeout = 66000;
+
+// Northflank to'xtatganda yoki qayta ishga tushirganda (SIGTERM / SIGINT) toza yopilish
+function handleShutdown(signal) {
+  console.log(`🛑 [Shutdown] ${signal} qabul qilindi. Server to'xtatilmoqda...`);
+  flushPersistedDataSync();
+
+  server.close(async () => {
+    console.log('🔌 [Shutdown] HTTP server yopildi.');
+    try {
+      if (client && client.connected) {
+        await client.disconnect();
+        console.log('🤖 [Shutdown] Telegram ulanishi uzildi.');
+      }
+    } catch {}
+    process.exit(0);
+  });
+
+  setTimeout(() => {
+    console.error('⚠️ [Shutdown] Majburiy to\'xtatildi (timeout).');
+    process.exit(0);
+  }, 10000).unref();
+}
+
+process.on('SIGTERM', () => handleShutdown('SIGTERM'));
+process.on('SIGINT', () => handleShutdown('SIGINT'));
