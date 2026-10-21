@@ -2,6 +2,9 @@ FROM node:22-alpine
 
 WORKDIR /app
 
+# Tezkor HLS remuxing uchun yengil FFmpeg
+RUN apk add --no-cache ffmpeg
+
 # Kuchsiz konteynerlar (Northflank Micro/Free tier) uchun xotira va GC sozlamalari
 ENV NODE_ENV=production
 ENV PORT=3000

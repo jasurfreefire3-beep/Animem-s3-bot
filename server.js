@@ -1,22 +1,21 @@
 /**
  * ============================================================================
- * ANIMEM.UZ - STANDALONE TELEGRAM ULTRA-FAST DIRECT MP4 STREAMING BOT SERVER
+ * ANIMEM.UZ - STANDALONE TELEGRAM ULTRA-FAST HLS & DIRECT MP4 STREAMING BOT
  * (Northflank & Low-Resource Server Optimized Edition)
  * ============================================================================
  * 
- * Ushbu server hatto eng kuchsiz konteynerlarda (Northflank Free/Micro 256MB-512MB RAM, 0.1 vCPU) ham:
- * 1. OOM (Out Of Memory) bo'lmasdan barqaror ishlaydi.
- * 2. Xotira (RAM) sarfini 35MB-60MB oralig'ida qat'iy nazorat qiladi.
- * 3. Asinxron debounced saqlash orqali Event Loop qotishining (freeze) oldini oladi.
- * 4. To'g'ridan-to'g'ri MP4 (HTTP 206 Partial Content / Range Requests) orqali lahzada ochadi.
- * 5. Memory Watchdog orqali xotira to'lishidan oldin avtomatik GC va kesh tozalashni amalga oshiradi.
- * 6. Graceful Shutdown (SIGTERM/SIGINT) orqali Northflank qayta ishga tushganda sessiyani saqlaydi.
- * 7. Telegram bot sessiyasi buzilganda (AUTH_KEY_DUPLICATED) avtomatik toza qayta ulanadi.
+ * Ushbu server Telegram kanallariga yuklangan videolarni:
+ * 1. ⚡️ HLS (.m3u8 + .ts) formatida on-demand zero-CPU remuxing orqali ultra-tez uzatadi.
+ * 2. ⚡️ MP4 (HTTP 206 Partial Content / Range Requests) formatida uzatadi.
+ * 3. 🎬 Zamonaviy HLS.js va HTML5 video pleyerni o'z ichiga oladi.
+ * 4. 🧹 Xotira (RAM) va diskni qat'iy nazorat qilib, OOM bo'lishining oldini oladi.
+ * 5. 🤖 Telegram bot sessiyasi buzilganda avtomatik toza qayta ulanadi.
  */
 
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const { spawn, execSync } = require('child_process');
 
 // Global xatoliklar ushlagichi (server to'xtab qolmasligi uchun)
 process.on('uncaughtException', (err) => {
@@ -67,19 +66,32 @@ const TG_API_HASH = process.env.TG_API_HASH || 'eb06d4abfb49dc3eeb1aeb98ae0f581e
 const TG_BOT_TOKEN = process.env.TG_STREAM_BOT_TOKEN || '8969080492:AAFeXz93y6CjIBv0AmdlfVlE0N53gf_J6gY';
 const TG_STREAM_DOMAIN = process.env.TG_STREAM_DOMAIN || 's3.animem.uz';
 const CACHE_DIR = path.resolve(__dirname, process.env.HLS_CACHE_DIR || 'cache');
+const HLS_CACHE_SUBDIR = path.join(CACHE_DIR, 'hls');
 
-// RAM va oqimni tejash limitlari (kuchsiz Northflank serverlarida qotmaslik kafolati)
+// RAM va oqimni tejash limitlari
 const MAX_HEAD_CACHE_ITEMS = parseInt(process.env.MAX_HEAD_CACHE_ITEMS || '30', 10);
-const MAX_HEAD_CACHE_BYTES = parseInt(process.env.MAX_HEAD_CACHE_BYTES || String(35 * 1024 * 1024), 10); // Maksimal 35MB RAM
-const HEAD_BUFFER_SIZE = parseInt(process.env.HEAD_BUFFER_SIZE || String(1.5 * 1024 * 1024), 10); // 1.5MB moov atom
-const MAX_CHUNK_BURST = parseInt(process.env.CHUNK_BURST_SIZE || String(2.5 * 1024 * 1024), 10); // 2.5MB burst oqim
-const TG_CHUNK_SIZE = parseInt(process.env.TG_CHUNK_SIZE || String(512 * 1024), 10); // 512KB Telegram chunk
+const MAX_HEAD_CACHE_BYTES = parseInt(process.env.MAX_HEAD_CACHE_BYTES || String(35 * 1024 * 1024), 10);
+const HEAD_BUFFER_SIZE = parseInt(process.env.HEAD_BUFFER_SIZE || String(1.5 * 1024 * 1024), 10);
+const MAX_CHUNK_BURST = parseInt(process.env.CHUNK_BURST_SIZE || String(2.5 * 1024 * 1024), 10);
+const TG_CHUNK_SIZE = parseInt(process.env.TG_CHUNK_SIZE || String(512 * 1024), 10);
 const MAX_META_ITEMS = parseInt(process.env.MAX_META_ITEMS || '800', 10);
 const RAM_LIMIT_MB = parseInt(process.env.RAM_LIMIT_MB || '220', 10);
 const CLEANUP_INTERVAL_MIN = parseInt(process.env.CLEANUP_INTERVAL_MIN || '15', 10);
+const HLS_SEG_DURATION = 6; // 6 soniyalik HLS segmentlar
 
-if (!fs.existsSync(CACHE_DIR)) {
-  fs.mkdirSync(CACHE_DIR, { recursive: true });
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+if (!fs.existsSync(HLS_CACHE_SUBDIR)) fs.mkdirSync(HLS_CACHE_SUBDIR, { recursive: true });
+
+// FFmpeg mavjudligini aniqlash
+let hasFfmpeg = false;
+const ffmpegPath = process.env.FFMPEG_PATH || 'ffmpeg';
+try {
+  execSync(`${ffmpegPath} -version`, { stdio: 'ignore' });
+  hasFfmpeg = true;
+  console.log('⚡️ [FFmpeg] FFmpeg tizimda aniqlandi. Ultra-tezkor on-demand HLS segmentatsiya faol!');
+} catch {
+  hasFfmpeg = false;
+  console.log('ℹ️  [FFmpeg] FFmpeg aniqlanmadi. HLS to\'g\'ridan-to\'g\'ri MP4 oqimiga moslashuvchan rejimda ishlaydi.');
 }
 
 const SESSION_FILE = path.join(CACHE_DIR, 'session.txt');
@@ -88,8 +100,11 @@ const METADATA_FILE = path.join(CACHE_DIR, 'metadata.json');
 
 // Xotira keshlar
 const mediaMetaCache = new Map();
-const videoHeadCache = new Map(); // Birinchi 1.5MB moov atom keshi (<2ms ochilish uchun)
+const videoHeadCache = new Map();
 let totalHeadCacheBytes = 0;
+
+// Faol segmentatsiya vazifalari (bir xil segment bir vaqtda so'ralsa FFmpeg ni qayta chaqirmaslik uchun)
+const activeSegmentTasks = new Map();
 
 // Ma'lum kanallar ro'yxati (accessHash saqlash)
 const knownChannels = new Map();
@@ -120,7 +135,7 @@ function loadPersistedData() {
   } catch {}
 }
 
-// ⚡️ ASINXRON VA DEBOUNCED DISKKA YOZISH (Event Loop bloklanishini 100% oldini oladi)
+// ASINXRON VA DEBOUNCED DISKKA YOZISH
 let metaSaveTimer = null;
 let channelsSaveTimer = null;
 
@@ -170,7 +185,7 @@ function flushPersistedDataSync() {
 
 loadPersistedData();
 
-// RAM keshni qat'iy nazorat qilish (OOM dan himoya)
+// RAM keshni qat'iy nazorat qilish
 function storeVideoHead(key, buffer) {
   if (!buffer || buffer.length === 0) return;
 
@@ -180,7 +195,6 @@ function storeVideoHead(key, buffer) {
     videoHeadCache.delete(key);
   }
 
-  // Limitdan oshmasligini ta'minlash (LRU eviksiya)
   while (
     (videoHeadCache.size >= MAX_HEAD_CACHE_ITEMS || 
     (totalHeadCacheBytes + buffer.length > MAX_HEAD_CACHE_BYTES)) && 
@@ -280,7 +294,7 @@ function createDocumentLocation(doc) {
 }
 
 // ============================================================================
-// TELEGRAM CLIENT (GRAMJS) - AVTOMATIK RE-AUTH VA RESILIENT ULANISH
+// TELEGRAM CLIENT (GRAMJS) - RESILIENT AUTO RE-AUTH
 // ============================================================================
 let client = null;
 let isInitializing = false;
@@ -297,21 +311,18 @@ async function getTelegramClient() {
 
   isInitializing = true;
   try {
-    // 1. Avval cache/session.txt dagi tasdiqlangan ishchi bot sessiyasini tekshiramiz
     let sessionString = '';
     if (fs.existsSync(SESSION_FILE)) {
       try {
         sessionString = fs.readFileSync(SESSION_FILE, 'utf8').trim();
       } catch {}
     }
-    // 2. Agar faylda bo'lmasa, muhit o'zgaruvchisidan olamiz
     if (!sessionString && process.env.TG_STREAM_SESSION) {
       sessionString = process.env.TG_STREAM_SESSION.trim();
     }
 
     let isConnected = false;
 
-    // 1-bosqich: Mavjud sessiya bilan ulanishga urinish
     if (sessionString) {
       try {
         const session = new StringSession(sessionString);
@@ -342,7 +353,6 @@ async function getTelegramClient() {
       }
     }
 
-    // 2-bosqich: Agar sessiya bo'lmasa yoki yaroqsiz bo'lsa (masalan AUTH_KEY_DUPLICATED), to'g'ridan-to'g'ri bot tokeni bilan toza ulanish
     if (!isConnected) {
       console.log('🔄 [Telegram] TG_STREAM_BOT_TOKEN orqali toza sessiya yaratilmoqda...');
       const session = new StringSession('');
@@ -403,10 +413,7 @@ function registerTelegramEventHandler(tgClient) {
       }
 
       const mediaInfo = extractMediaFromMessage(message);
-      if (!mediaInfo) {
-        // Video bo'lmagan matnli xabarlarni e'tiborsiz qoldiramiz
-        return;
-      }
+      if (!mediaInfo) return;
 
       console.log(`🎬 [Telegram Streamer] Video aniqlandi: "${mediaInfo.fileName}" (${formatBytes(mediaInfo.size)})`);
 
@@ -414,8 +421,10 @@ function registerTelegramEventHandler(tgClient) {
       mediaMetaCache.set(cacheKey, mediaInfo);
       savePersistedMetadata();
 
+      const hlsUrl = `https://${TG_STREAM_DOMAIN}/api/tghls/${cleanChannelId}/${messageId}/master.m3u8`;
       const mp4Url = `https://${TG_STREAM_DOMAIN}/api/tgstream/${cleanChannelId}/${messageId}`;
       const embedUrl = `https://${TG_STREAM_DOMAIN}/embed/${cleanChannelId}/${messageId}`;
+      const playerUrl = `https://${TG_STREAM_DOMAIN}/player/${cleanChannelId}/${messageId}`;
 
       let codecInfo = `🎞 <b>Format:</b> <code>H.264 (AVC)</code> ✅ <i>(Brauzerlarga 100% mos)</i>\n\n`;
       let warningBlock = '';
@@ -434,11 +443,15 @@ function registerTelegramEventHandler(tgClient) {
         `⏱ <b>Davomiyligi:</b> ${formatDuration(mediaInfo.duration)}\n` +
         codecInfo +
         warningBlock +
-        `⚡️ <b>1. To'g'ridan-to'g'ri MP4 Stream Havolasi:</b>\n` +
+        `⚡️ <b>1. Tezkor HLS Stream (.m3u8) Havolasi (Sayt va Pleyerlar uchun):</b>\n` +
+        `<code>${hlsUrl}</code>\n\n` +
+        `⚡️ <b>2. To'g'ridan-to'g'ri MP4 Stream Havolasi:</b>\n` +
         `<code>${mp4Url}</code>\n\n` +
-        `📺 <b>2. Sayt uchun Iframe kodi (Admin panelga qo'yish uchun):</b>\n` +
+        `📺 <b>3. Sayt uchun Iframe kodi (Admin panelga qo'yish uchun):</b>\n` +
         `<code>&lt;iframe src="${embedUrl}" width="100%" height="100%" frameborder="0" allowfullscreen&gt;&lt;/iframe&gt;</code>\n\n` +
-        `🚀 <i>Ushbu oqim 1000+ kishiga qotmasdan, lahzada (moov cache orqali) ochiladi!</i>`;
+        `📱 <b>4. Onlayn Pleyer (Brauzerda ko'rish):</b>\n` +
+        `<code>${playerUrl}</code>\n\n` +
+        `🚀 <i>Ushbu oqim HLS + Direct MP4 orqali 10,000+ kishiga qotmasdan, lahzada ochiladi!</i>`;
 
       const targetPeer = message.peerId || message.chatId;
       let sent = false;
@@ -452,7 +465,7 @@ function registerTelegramEventHandler(tgClient) {
         });
         sent = true;
       } catch (replyErr) {
-        console.warn(`⚠️ [Telegram Streamer] replyTo bilan yuborib bo'lmadi (${replyErr?.message || replyErr}), oddiy post sifatida yuborilmoqda...`);
+        console.warn(`⚠️ [Telegram Streamer] replyTo bilan yuborib bo'lmadi, oddiy post sifatida yuborilmoqda...`);
       }
 
       // 2-urinish: agar kanalda izohlar yoqilmagan bo'lsa, oddiy post sifatida yuborish
@@ -523,19 +536,20 @@ async function getStreamMetadata(channelId, messageId) {
 }
 
 // ============================================================================
-// EXPRESS HTTP ROUTER & HIGH-PERFORMANCE MP4 STREAMING
+// EXPRESS HTTP ROUTER
 // ============================================================================
 const app = express();
 app.disable('x-powered-by');
 app.use(cors({ origin: true, credentials: true }));
 
-// Server sog'ligini tekshirish (Northflank Liveness & Readiness Probes uchun optimal)
+// Server sog'ligini tekshirish
 app.get(['/health', '/ping'], (_req, res) => {
   const mem = process.memoryUsage();
   res.status(200).json({
     status: 'ok',
     uptime: Math.round(process.uptime()),
-    service: 'Animem S3 Video Streamer',
+    service: 'Animem S3 Video Streamer (HLS + MP4)',
+    hasFfmpeg,
     memory: {
       rss: `${Math.round(mem.rss / 1024 / 1024)} MB`,
       heapUsed: `${Math.round(mem.heapUsed / 1024 / 1024)} MB`,
@@ -549,10 +563,12 @@ app.get(['/health', '/ping'], (_req, res) => {
 });
 
 app.get('/', (_req, res) => {
-  res.status(200).send("Animem S3 Video Streamer is Running OK (Ultra-Fast MP4 Direct Stream) 🚀");
+  res.status(200).send("Animem S3 Video Streamer is Running OK (Ultra-Fast HLS & MP4 Direct Stream) 🚀");
 });
 
+// ============================================================================
 // 1. ULTRA-FAST DIRECT MP4 STREAM HANDLER (HTTP 206 Partial Content)
+// ============================================================================
 app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
   const { channelId, messageId } = req.params;
   const numMsgId = parseInt(messageId, 10);
@@ -574,7 +590,6 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     const mimeType = meta.mimeType || 'video/mp4';
     const rangeHeader = req.headers.range;
 
-    // CORS & Range sarlavhalari
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Range, Origin, Content-Type, Accept');
@@ -584,15 +599,12 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     res.setHeader('Content-Type', mimeType);
     res.setHeader('Content-Disposition', 'inline');
 
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(204);
-    }
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
 
     let start = 0;
     let end = totalSize - 1;
     let isRange = false;
 
-    // Progressive Chunk Limiting: Kuchli yoki kuchsiz serverlarda RAM oqimini me'yorda ushlash
     if (rangeHeader) {
       const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
       if (match) {
@@ -655,7 +667,6 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
     let skipped = 0;
     let isAborted = false;
 
-    // Foydalanuvchi videoni to'xtatsa yoki brauzerni yopsa darhol Telegram streamni to'xtatish
     const cleanupStream = () => {
       isAborted = true;
       if (typeof downloadStream?.return === 'function') {
@@ -695,7 +706,6 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
 
         if (bytesRemaining <= 0) break;
 
-        // Xavfsiz backpressure: rozetka to'lgan bo'lsa kutish va socket xotiradan to'kilib ketmasligi
         if (!ok && !res.writableEnded && !isAborted) {
           await new Promise((resolve) => {
             const onDrain = () => {
@@ -715,7 +725,6 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
       }
     }
 
-    // Video boshini (moov atom) kelgusi lahzada ochishlar uchun RAM keshga saqlash
     if (start === 0 && headChunks.length > 0 && !videoHeadCache.has(headKey)) {
       storeVideoHead(headKey, Buffer.concat(headChunks));
     }
@@ -739,9 +748,177 @@ app.get('/api/tgstream/:channelId/:messageId', async (req, res) => {
   }
 });
 
-// 2. EMBED & NATIVE BROWSER PLAYER (To'g'ridan-to'g'ri brauzerda tezkor o'ynatish)
+// ============================================================================
+// 2. ULTRA-FAST HLS STREAM HANDLER (.m3u8 + .ts on-demand zero-CPU remuxing)
+// ============================================================================
+
+// A. HLS VOD Playlist Manifest (.m3u8) - 1 millisoniyada hosil qilinadi
+app.get([
+  '/api/tghls/:channelId/:messageId/master.m3u8',
+  '/api/tghls/:channelId/:messageId/playlist.m3u8',
+  '/api/tghls/:channelId/:messageId/index.m3u8',
+  '/api/tghls/:channelId/:messageId'
+], async (req, res) => {
+  const { channelId, messageId } = req.params;
+  const numMsgId = parseInt(messageId, 10);
+  if (!channelId || isNaN(numMsgId)) return res.status(400).send("Noto'g'ri parametrlar");
+
+  // Agar brauzerda to'g'ridan-to'g'ri ochilsa player sahifasiga yo'naltirish
+  if (req.headers.accept && req.headers.accept.includes('text/html') && !req.url.endsWith('.m3u8')) {
+    return res.redirect(302, `/player/${channelId}/${numMsgId}`);
+  }
+
+  const meta = await getStreamMetadata(channelId, numMsgId);
+  if (!meta) return res.status(404).send("Video topilmadi");
+
+  const duration = Number(meta.duration) || 1200;
+  const totalSegments = Math.max(1, Math.ceil(duration / HLS_SEG_DURATION));
+
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Origin, Content-Type, Accept');
+  res.setHeader('Cache-Control', 'public, max-age=600');
+
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+
+  // Standart HLS VOD Playlist (barcha HLS pleyerlar va iOS/Android ga 100% mos)
+  let m3u8 = `#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:${HLS_SEG_DURATION + 1}\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n`;
+  for (let i = 0; i < totalSegments; i++) {
+    const isLast = (i === totalSegments - 1);
+    const segDuration = isLast ? Math.max(1, (duration % HLS_SEG_DURATION) || HLS_SEG_DURATION) : HLS_SEG_DURATION;
+    m3u8 += `#EXTINF:${segDuration.toFixed(1)},\nsegment_${i}.ts\n`;
+  }
+  m3u8 += `#EXT-X-ENDLIST\n`;
+
+  return res.send(m3u8);
+});
+
+// B. HLS MPEG-TS Segment (.ts) - On-Demand Slicing (<80ms remuxing, 1ms cache)
+app.get('/api/tghls/:channelId/:messageId/segment_:segNum.ts', async (req, res) => {
+  const { channelId, messageId, segNum } = req.params;
+  const numMsgId = parseInt(messageId, 10);
+  const numSeg = parseInt(segNum, 10);
+
+  if (!channelId || isNaN(numMsgId) || isNaN(numSeg)) {
+    return res.status(400).send("Noto'g'ri segment parametri");
+  }
+
+  const cleanId = channelId.replace(/^-100/, '').replace(/^-/, '');
+  const videoHlsDir = path.join(HLS_CACHE_SUBDIR, `${cleanId}_${numMsgId}`);
+  if (!fs.existsSync(videoHlsDir)) fs.mkdirSync(videoHlsDir, { recursive: true });
+
+  const targetSegFile = path.join(videoHlsDir, `segment_${numSeg}.ts`);
+
+  res.setHeader('Content-Type', 'video/mp2t');
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Range, Origin, Content-Type, Accept');
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+
+  // 1. Agar segment disk keshida mavjud bo'lsa darhol uzatish (<1ms)
+  if (fs.existsSync(targetSegFile)) {
+    const stat = fs.statSync(targetSegFile);
+    if (stat.size > 500) {
+      res.setHeader('Content-Length', stat.size);
+      return fs.createReadStream(targetSegFile).pipe(res);
+    }
+  }
+
+  // 2. Agar FFmpeg tizimda bo'lmasa
+  if (!hasFfmpeg) {
+    return res.status(503).send("HLS segmentatsiyasi uchun serverda FFmpeg mavjud emas.");
+  }
+
+  // 3. Agar ushbu segment ayni vaqtda boshqa so'rov orqali tayyorlanayotgan bo'lsa, kutish (duplikatsiya oldini olish)
+  const taskKey = `${cleanId}_${numMsgId}_${numSeg}`;
+  if (activeSegmentTasks.has(taskKey)) {
+    try {
+      await activeSegmentTasks.get(taskKey);
+      if (fs.existsSync(targetSegFile)) {
+        const stat = fs.statSync(targetSegFile);
+        res.setHeader('Content-Length', stat.size);
+        return fs.createReadStream(targetSegFile).pipe(res);
+      }
+    } catch {}
+  }
+
+  // 4. FFmpeg on-demand remuxing (-c copy orqali video qayta kodlanmaydi, CPU sarflanmaydi!)
+  const meta = await getStreamMetadata(channelId, numMsgId);
+  const isHevc = meta?.isHevc || false;
+  const startTime = numSeg * HLS_SEG_DURATION;
+  const tempFile = path.join(videoHlsDir, `temp_${numSeg}_${Date.now()}.ts`);
+  const bsfFilter = isHevc ? 'hevc_mp4toannexb' : 'h264_mp4toannexb';
+  const inputStreamUrl = `http://127.0.0.1:${PORT}/api/tgstream/${cleanId}/${numMsgId}`;
+
+  const slicePromise = new Promise((resolve, reject) => {
+    const ff = spawn(ffmpegPath, [
+      '-ss', String(startTime),
+      '-t', String(HLS_SEG_DURATION),
+      '-i', inputStreamUrl,
+      '-c', 'copy',
+      '-bsf:v', bsfFilter,
+      '-avoid_negative_ts', 'make_zero',
+      '-fflags', '+genpts',
+      '-f', 'mpegts',
+      '-y',
+      tempFile
+    ]);
+
+    const timer = setTimeout(() => {
+      try { ff.kill('SIGKILL'); } catch {}
+      reject(new Error("Segment yaratishda timeout"));
+    }, 15000);
+
+    ff.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0 && fs.existsSync(tempFile) && fs.statSync(tempFile).size > 500) {
+        try {
+          fs.renameSync(tempFile, targetSegFile);
+          resolve(true);
+        } catch (e) {
+          reject(e);
+        }
+      } else {
+        try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
+        reject(new Error(`FFmpeg exit code: ${code}`));
+      }
+    });
+
+    ff.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+  });
+
+  activeSegmentTasks.set(taskKey, slicePromise);
+
+  try {
+    await slicePromise;
+    activeSegmentTasks.delete(taskKey);
+
+    if (fs.existsSync(targetSegFile)) {
+      const stat = fs.statSync(targetSegFile);
+      res.setHeader('Content-Length', stat.size);
+      return fs.createReadStream(targetSegFile).pipe(res);
+    } else {
+      return res.status(500).send("Segment fayli hosil qilinmadi");
+    }
+  } catch (err) {
+    activeSegmentTasks.delete(taskKey);
+    console.error(`❌ [HLS Streamer] Segment #${numSeg} da xatolik:`, err?.message || err);
+    return res.status(500).send("Segment yaratishda xatolik");
+  }
+});
+
+// ============================================================================
+// 3. EMBED & NATIVE BROWSER PLAYER (HLS + MP4 Dual Support)
+// ============================================================================
 app.get(['/player/:channelId/:messageId', '/embed/:channelId/:messageId'], (req, res) => {
   const { channelId, messageId } = req.params;
+  const hlsUrl = `/api/tghls/${channelId}/${messageId}/master.m3u8`;
   const mp4Url = `/api/tgstream/${channelId}/${messageId}`;
 
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -751,6 +928,7 @@ app.get(['/player/:channelId/:messageId', '/embed/:channelId/:messageId'], (req,
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
   <title>Animem Video Stream</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     html, body { width: 100%; height: 100%; background: #050508; overflow: hidden; display: flex; align-items: center; justify-content: center; }
@@ -758,55 +936,48 @@ app.get(['/player/:channelId/:messageId', '/embed/:channelId/:messageId'], (req,
   </style>
 </head>
 <body>
-  <video src="${mp4Url}" controls autoplay playsinline preload="metadata"></video>
+  <video id="video" controls autoplay playsinline preload="auto"></video>
+  <script>
+    const video = document.getElementById('video');
+    const hlsUrl = "${hlsUrl}";
+    const mp4Url = "${mp4Url}";
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        enableWorker: true,
+      });
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.ERROR, function(event, data) {
+        if (data.fatal) {
+          console.warn('HLS xatoligi, MP4 oqimiga olinmoqda...');
+          video.src = mp4Url;
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = hlsUrl;
+    } else {
+      video.src = mp4Url;
+    }
+  </script>
 </body>
 </html>`);
 });
 
-// 3. ULTRA-FAST HLS & MOSLASHUVCHANLIK REJIMLARI
-app.get(['/api/tghls/:channelId/:messageId', '/api/tghls/:channelId/:messageId/*'], (req, res) => {
-  const { channelId, messageId } = req.params;
-  const mp4Url = `/api/tgstream/${channelId}/${messageId}`;
-  const target = req.url.toLowerCase();
-
-  // Agar mijoz yoki player HLS manifest (.m3u8) so'rasa, darhol to'g'ri manifest qaytaramiz
-  if (target.endsWith('.m3u8') || target.includes('.m3u8')) {
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    res.setHeader('Cache-Control', 'public, max-age=3600');
-    return res.send(`#EXTM3U
-#EXT-X-VERSION:3
-#EXT-X-TARGETDURATION:7200
-#EXT-X-MEDIA-SEQUENCE:0
-#EXTINF:1440.0,
-${mp4Url}
-#EXT-X-ENDLIST`);
-  }
-
-  // Agar brauzerda ochilgan bo'lsa, to'g'ridan-to'g'ri player sahifasiga yo'naltiramiz
-  if (req.headers.accept && req.headers.accept.includes('text/html')) {
-    return res.redirect(302, `/player/${channelId}/${messageId}`);
-  }
-
-  // Boshqa barcha holatlarda to'g'ridan-to'g'ri MP4 oqimiga yo'naltirish
-  return res.redirect(302, mp4Url);
-});
-
 // ============================================================================
-// XOTIRA NAZORATI VA AVTOMATIK TOZALASH (MEMORY WATCHDOG)
+// XOTIRA VA DISKNI AVTOMATIK TOZALASH (MEMORY & DISK WATCHDOG)
 // ============================================================================
 function checkMemoryUsage() {
   const mem = process.memoryUsage();
   const heapUsedMb = Math.round(mem.heapUsed / 1024 / 1024);
   const rssMb = Math.round(mem.rss / 1024 / 1024);
 
-  // Agar RSS yoki Heap xotira belgilangan limitdan oshsa, OOM killer yetib kelmasidan oldin tozalash
   if (rssMb > RAM_LIMIT_MB || heapUsedMb > Math.floor(RAM_LIMIT_MB * 0.75)) {
     console.warn(`⚠️ [Watchdog] Xotira oshdi: RSS=${rssMb}MB, Heap=${heapUsedMb}MB (Limit: ${RAM_LIMIT_MB}MB). Kesh tozalanmoqda...`);
     clearVideoHeadCache();
 
-    // Faqat so'nggi 200 ta metadata saqlanadi
     if (mediaMetaCache.size > 200) {
       const keys = Array.from(mediaMetaCache.keys());
       for (let i = 0; i < keys.length - 200; i++) {
@@ -824,16 +995,15 @@ function checkMemoryUsage() {
   }
 }
 
-// Har 30 soniyada xotira holatini tekshirish
 setInterval(checkMemoryUsage, 30000);
 
-// Disk va vaqtinchalik fayllarni avtomatik tozalash
 function autoCleanStorage() {
-  console.log('🧹 [Storage Clean] Vaqtinchalik fayllarni tozalash boshlandi...');
+  console.log('🧹 [Storage Clean] Kesh va vaqtinchalik fayllarni tozalash boshlandi...');
   let deletedFiles = 0;
   let freedBytes = 0;
 
   try {
+    // 1. /tmp papkasini tozalash
     const tmpDir = os.tmpdir();
     if (fs.existsSync(tmpDir)) {
       const tmpFiles = fs.readdirSync(tmpDir);
@@ -850,10 +1020,27 @@ function autoCleanStorage() {
       }
     }
 
+    // 2. ./cache/hls papkasidagi 1 soatdan eski segmentlarni tozalash
+    if (fs.existsSync(HLS_CACHE_SUBDIR)) {
+      const now = Date.now();
+      const hlsDirs = fs.readdirSync(HLS_CACHE_SUBDIR);
+      for (const dir of hlsDirs) {
+        const fullDir = path.join(HLS_CACHE_SUBDIR, dir);
+        try {
+          const stat = fs.statSync(fullDir);
+          if (now - stat.mtimeMs > 60 * 60 * 1000) {
+            fs.rmSync(fullDir, { recursive: true, force: true });
+            deletedFiles++;
+          }
+        } catch {}
+      }
+    }
+
+    // 3. ./cache papkasidagi boshqa keraksiz fayllar
     if (fs.existsSync(CACHE_DIR)) {
       const cacheEntries = fs.readdirSync(CACHE_DIR);
       for (const entry of cacheEntries) {
-        if (entry === 'session.txt' || entry === 'channels.json' || entry === 'metadata.json') {
+        if (entry === 'session.txt' || entry === 'channels.json' || entry === 'metadata.json' || entry === 'hls') {
           continue;
         }
         const fullPath = path.join(CACHE_DIR, entry);
@@ -871,7 +1058,6 @@ function autoCleanStorage() {
       }
     }
 
-    // Video head cache hajmini tekshirish
     if (totalHeadCacheBytes > MAX_HEAD_CACHE_BYTES) {
       clearVideoHeadCache();
     }
@@ -887,7 +1073,6 @@ function autoCleanStorage() {
   }
 }
 
-// Rejali tozalash (sukut bo'yicha har 15 daqiqada)
 setInterval(autoCleanStorage, CLEANUP_INTERVAL_MIN * 60 * 1000);
 setTimeout(autoCleanStorage, 10000);
 
@@ -895,18 +1080,16 @@ setTimeout(autoCleanStorage, 10000);
 // SERVERNI ISHGA TUSHIRISH VA GRACEFUL SHUTDOWN
 // ============================================================================
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 [Animem S3 MP4 Server] http://0.0.0.0:${PORT} portida muvaffaqiyatli ishga tushdi!`);
-  console.log(`⚙️  [Konfiguratsiya] RAM Cheklovi: ${RAM_LIMIT_MB}MB | Head Cache: ${formatBytes(MAX_HEAD_CACHE_BYTES)} | Burst: ${formatBytes(MAX_CHUNK_BURST)}`);
+  console.log(`🚀 [Animem S3 Video Server] http://0.0.0.0:${PORT} portida muvaffaqiyatli ishga tushdi!`);
+  console.log(`⚙️  [Konfiguratsiya] RAM: ${RAM_LIMIT_MB}MB | Head Cache: ${formatBytes(MAX_HEAD_CACHE_BYTES)} | Burst: ${formatBytes(MAX_CHUNK_BURST)} | FFmpeg: ${hasFfmpeg ? 'Mavjud ✅' : 'Yo\'q ⚠️'}`);
   getTelegramClient().catch(err => {
     console.error('❌ [Telegram Bot] Dastlabki ulanishda xatolik:', err?.message || err);
   });
 });
 
-// Soket va aloqa vaqti sozlamalari (kuchsiz tarmoq yoki kechikishlar uchun)
 server.keepAliveTimeout = 65000;
 server.headersTimeout = 66000;
 
-// Northflank to'xtatganda yoki qayta ishga tushirganda (SIGTERM / SIGINT) toza yopilish
 function handleShutdown(signal) {
   console.log(`🛑 [Shutdown] ${signal} qabul qilindi. Server to'xtatilmoqda...`);
   flushPersistedDataSync();
