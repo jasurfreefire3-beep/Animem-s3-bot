@@ -11,6 +11,7 @@
  * 4. To'g'ridan-to'g'ri MP4 (HTTP 206 Partial Content / Range Requests) orqali lahzada ochadi.
  * 5. Memory Watchdog orqali xotira to'lishidan oldin avtomatik GC va kesh tozalashni amalga oshiradi.
  * 6. Graceful Shutdown (SIGTERM/SIGINT) orqali Northflank qayta ishga tushganda sessiyani saqlaydi.
+ * 7. Telegram bot sessiyasi buzilganda (AUTH_KEY_DUPLICATED) avtomatik toza qayta ulanadi.
  */
 
 const fs = require('fs');
@@ -81,8 +82,6 @@ if (!fs.existsSync(CACHE_DIR)) {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
 }
 
-// Doimiy ishlaydigan zaxira sessiya
-const DEFAULT_VERIFIED_SESSION = '1AgAOMTQ5LjE1NC4xNjcuNTEBuxOcQMgGpwIDM6ZoO26uVoE0bg9YRumiETYCG1gyZwFPHeiJfvGua1MFeYBAboD29xpq7Gz69EDmw2Sx+G0H5EmNIcCh62hjF2Fq+V6+j81Tasqe/LS9wPWRVxHb2K1D0T4GeDJKAXnAvl371KEOoNXjdT28Kh09kQVYkpygd92qmvnfARqd2ZATA5fO4zmh8WRjMsE0C6wFkW1Y8upMT7b8rFzRTqIhyF/anOxtBhH17EeqXL21ZZqAXbi51oMydHgk2vwuxzeLit5xTZ0hDs8jVt/l8xHh3TzPLyAnzdiS9FFKs09dO6T4m2LQbOxUU7HHt/QO3bgbjbq9u8YZOjs=';
 const SESSION_FILE = path.join(CACHE_DIR, 'session.txt');
 const CHANNELS_FILE = path.join(CACHE_DIR, 'channels.json');
 const METADATA_FILE = path.join(CACHE_DIR, 'metadata.json');
@@ -226,21 +225,25 @@ function extractMediaFromMessage(message) {
   const doc = message.media.document || message.media;
   if (!doc || !doc.id) return null;
 
-  const isVideo = (doc.mimeType && doc.mimeType.startsWith('video/')) ||
-    (doc.attributes && doc.attributes.some(a => a.className === 'DocumentAttributeVideo')) ||
-    message.media.className === 'MessageMediaVideo';
-
-  if (!isVideo) return null;
+  const isVideoAttr = doc.attributes && doc.attributes.some(a => a.className === 'DocumentAttributeVideo');
+  const isVideoMime = doc.mimeType && doc.mimeType.startsWith('video/');
+  const isVideoClass = message.media.className === 'MessageMediaVideo';
 
   const filenameAttr = doc.attributes?.find(a => a.className === 'DocumentAttributeFilename');
   const videoAttr = doc.attributes?.find(a => a.className === 'DocumentAttributeVideo');
 
   const fileName = filenameAttr?.fileName || `video_${message.id}.mp4`;
+  const lowerName = fileName.toLowerCase();
+  const isVideoByExt = lowerName.endsWith('.mp4') || lowerName.endsWith('.mkv') || lowerName.endsWith('.mov') || lowerName.endsWith('.webm') || lowerName.endsWith('.avi');
+
+  if (!isVideoAttr && !isVideoMime && !isVideoClass && !isVideoByExt) {
+    return null;
+  }
+
   const size = Number(doc.size || 0);
   const duration = videoAttr?.duration || 0;
   const mimeType = doc.mimeType || 'video/mp4';
   const videoCodec = videoAttr?.videoCodec || null;
-  const lowerName = fileName.toLowerCase();
   const isHevc = lowerName.includes('hevc') || lowerName.includes('x265') || lowerName.includes('h.265') || lowerName.includes('h265');
 
   return {
@@ -277,7 +280,7 @@ function createDocumentLocation(doc) {
 }
 
 // ============================================================================
-// TELEGRAM CLIENT (GRAMJS) - OPTIMIZED FOR CONTAINERS
+// TELEGRAM CLIENT (GRAMJS) - AVTOMATIK RE-AUTH VA RESILIENT ULANISH
 // ============================================================================
 let client = null;
 let isInitializing = false;
@@ -294,47 +297,80 @@ async function getTelegramClient() {
 
   isInitializing = true;
   try {
-    let sessionString = process.env.TG_STREAM_SESSION || '';
-    if (!sessionString && fs.existsSync(SESSION_FILE)) {
+    // 1. Avval cache/session.txt dagi tasdiqlangan ishchi bot sessiyasini tekshiramiz
+    let sessionString = '';
+    if (fs.existsSync(SESSION_FILE)) {
       try {
         sessionString = fs.readFileSync(SESSION_FILE, 'utf8').trim();
       } catch {}
     }
-    if (!sessionString) {
-      sessionString = DEFAULT_VERIFIED_SESSION;
+    // 2. Agar faylda bo'lmasa, muhit o'zgaruvchisidan olamiz
+    if (!sessionString && process.env.TG_STREAM_SESSION) {
+      sessionString = process.env.TG_STREAM_SESSION.trim();
     }
 
-    const session = new StringSession(sessionString);
+    let isConnected = false;
 
-    client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
-      connectionRetries: 10,
-      autoReconnect: true,
-      floodSleepThreshold: 60,
-      deviceModel: 'Northflank Streamer',
-      systemVersion: 'Linux',
-      appVersion: '1.0.0',
-      useWSS: false,
-    });
+    // 1-bosqich: Mavjud sessiya bilan ulanishga urinish
+    if (sessionString) {
+      try {
+        const session = new StringSession(sessionString);
+        client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
+          connectionRetries: 5,
+          autoReconnect: true,
+          floodSleepThreshold: 60,
+          deviceModel: 'Northflank Streamer',
+          systemVersion: 'Linux',
+          appVersion: '1.0.0',
+          useWSS: false,
+        });
 
-    await client.connect();
+        await client.connect();
 
-    const isAuthorized = await client.checkAuthorization().catch(() => false);
-    if (!isAuthorized) {
-      console.log('🔄 Telegram bot avtorizatsiyadan o\'tmoqda...');
+        const isAuthorized = await client.checkAuthorization().catch(() => false);
+        if (isAuthorized) {
+          isConnected = true;
+        } else {
+          console.warn('⚠️ [Telegram] Saqlangan sessiya avtorizatsiyadan o\'tmadi. Bot tokeni orqali yangilanmoqda...');
+          try { await client.disconnect(); } catch {}
+          client = null;
+        }
+      } catch (sessErr) {
+        console.warn(`⚠️ [Telegram] Sessiya xatoligi (${sessErr?.message || sessErr}). Yangi toza sessiya yaratilmoqda...`);
+        try { if (client) await client.disconnect(); } catch {}
+        client = null;
+      }
+    }
+
+    // 2-bosqich: Agar sessiya bo'lmasa yoki yaroqsiz bo'lsa (masalan AUTH_KEY_DUPLICATED), to'g'ridan-to'g'ri bot tokeni bilan toza ulanish
+    if (!isConnected) {
+      console.log('🔄 [Telegram] TG_STREAM_BOT_TOKEN orqali toza sessiya yaratilmoqda...');
+      const session = new StringSession('');
+      client = new TelegramClient(session, TG_API_ID, TG_API_HASH, {
+        connectionRetries: 5,
+        autoReconnect: true,
+        floodSleepThreshold: 60,
+        deviceModel: 'Northflank Streamer',
+        systemVersion: 'Linux',
+        appVersion: '1.0.0',
+        useWSS: false,
+      });
+
       await client.start({ botAuthToken: TG_BOT_TOKEN });
       const newSess = client.session.save();
       try {
         fs.writeFileSync(SESSION_FILE, newSess);
+        console.log('💾 [Telegram] Yangi ishchi bot sessiyasi saqlandi.');
       } catch {}
     }
 
     const me = await client.getMe();
-    console.log(`🤖 [Telegram Bot] Muvaffaqiyatli ulandi: @${me.username}`);
+    console.log(`🤖 [Telegram Bot] Muvaffaqiyatli ulandi: @${me.username} (ID: ${me.id})`);
 
     registerTelegramEventHandler(client);
     return client;
   } catch (err) {
-    console.error('❌ [Telegram Bot] Ulanishda xatolik:', err?.message || err);
+    console.error('❌ [Telegram Bot] Ulanishda jiddiy xatolik:', err?.message || err);
     throw err;
   } finally {
     isInitializing = false;
@@ -348,10 +384,13 @@ function registerTelegramEventHandler(tgClient) {
       const message = event.message;
       if (!message) return;
 
-      const chat = message.chat || event.chat;
-      const cleanChannelId = String(message.chatId || message.peerId?.channelId || '')
-        .replace(/^-100/, '')
-        .replace(/^-/, '');
+      console.log(`📩 [Telegram Streamer] Yangi xabar aniqlandi! ID: ${message.id}`);
+
+      const chat = message.chat || event.chat || (await message.getChat().catch(() => null));
+      const channelIdRaw = message.peerId?.channelId 
+        ? message.peerId.channelId.toString() 
+        : (message.chatId ? message.chatId.toString() : '');
+      const cleanChannelId = channelIdRaw.replace(/^-100/, '').replace(/^-/, '');
       const messageId = message.id;
 
       if (cleanChannelId && chat && chat.accessHash) {
@@ -364,7 +403,12 @@ function registerTelegramEventHandler(tgClient) {
       }
 
       const mediaInfo = extractMediaFromMessage(message);
-      if (!mediaInfo) return;
+      if (!mediaInfo) {
+        // Video bo'lmagan matnli xabarlarni e'tiborsiz qoldiramiz
+        return;
+      }
+
+      console.log(`🎬 [Telegram Streamer] Video aniqlandi: "${mediaInfo.fileName}" (${formatBytes(mediaInfo.size)})`);
 
       const cacheKey = `${cleanChannelId}_${messageId}`;
       mediaMetaCache.set(cacheKey, mediaInfo);
@@ -396,15 +440,39 @@ function registerTelegramEventHandler(tgClient) {
         `<code>&lt;iframe src="${embedUrl}" width="100%" height="100%" frameborder="0" allowfullscreen&gt;&lt;/iframe&gt;</code>\n\n` +
         `🚀 <i>Ushbu oqim 1000+ kishiga qotmasdan, lahzada (moov cache orqali) ochiladi!</i>`;
 
-      await tgClient.sendMessage(message.chatId, {
-        message: replyHtml,
-        parseMode: 'html',
-        replyTo: messageId
-      });
+      const targetPeer = message.peerId || message.chatId;
+      let sent = false;
 
-      console.log(`[Telegram Streamer] Havola yuborildi: #${messageId} (Kanal: ${cleanChannelId})`);
+      // 1-urinish: replyTo bilan javob berish
+      try {
+        await tgClient.sendMessage(targetPeer, {
+          message: replyHtml,
+          parseMode: 'html',
+          replyTo: messageId
+        });
+        sent = true;
+      } catch (replyErr) {
+        console.warn(`⚠️ [Telegram Streamer] replyTo bilan yuborib bo'lmadi (${replyErr?.message || replyErr}), oddiy post sifatida yuborilmoqda...`);
+      }
+
+      // 2-urinish: agar kanalda izohlar yoqilmagan bo'lsa, oddiy post sifatida yuborish
+      if (!sent) {
+        try {
+          await tgClient.sendMessage(targetPeer, {
+            message: replyHtml,
+            parseMode: 'html'
+          });
+          sent = true;
+        } catch (postErr) {
+          console.error(`❌ [Telegram Streamer] Kanalga xabar yuborishda xatolik:`, postErr?.message || postErr);
+        }
+      }
+
+      if (sent) {
+        console.log(`✅ [Telegram Streamer] Javob havolasi muvaffaqiyatli yuborildi: #${messageId} (Kanal: ${cleanChannelId})`);
+      }
     } catch (err) {
-      console.warn('[Telegram Streamer] Yangi xabarni qayta ishlashda ogohlantirish:', err?.message || err);
+      console.error('❌ [Telegram Streamer] Yangi xabarni qayta ishlashda xatolik:', err?.message || err);
     }
   }, new NewMessage({}));
 }
