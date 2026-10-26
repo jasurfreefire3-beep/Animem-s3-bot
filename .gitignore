@@ -1,4 +1,6 @@
 node_modules/
+bin/
+.wasmer/
 cache/
 *.log
 .DS_Store

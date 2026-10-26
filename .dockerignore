@@ -8,5 +8,6 @@ cache/*
 !cache/session.txt
 !cache/channels.json
 !cache/metadata.json
+!cache/heads/*.head
 *.log
 

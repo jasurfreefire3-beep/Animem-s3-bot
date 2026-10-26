@@ -1,138 +1,72 @@
 # 🚀 Animem S3 Video Streaming & Telegram Bot Server
 
-Telegram kanallari orqali yuklangan videolarni to'g'ridan-to'g'ri internetda va **Animem.uz** saytida **YouTube tezligida**, 10,000+ kishiga qotmasdan **HLS (`.m3u8`)** va **MP4** formatida stream qiluvchi mustaqil VPS serveri.
+Telegram kanallari orqali yuklangan videolarni to'g'ridan-to'g'ri internetda va **Animem.uz** saytida **YouTube tezligida**, 10,000+ kishiga qotmasdan **Ultra-Fast Direct MP4 (HTTP 206 Partial Content)** formatida stream qiluvchi yuqori unumdorlikdagi media serveri (Northflank, Wasmer Edge va VPS uchun moslashtirilgan).
 
 ---
 
 ## 🌟 Asosiy Imkoniyatlar
 
-1. ⚡️ **HLS (HTTP Live Streaming) + Edge CDN:**
-   - 6 soniyalik avtomatik bo'lingan MPEG-TS segmentlar.
-   - 30 kunlik Cloudflare CDN kesh sarlavhalari (`Cache-Control: immutable`).
-   - 10,000+ tomoshabin bir vaqtda kirsa ham serveringiz qotmaydi, oqim to'g'ridan-to'g'ri CDN'dan o'tadi.
+1. ⚡️ **Ultra-Tezkor Direct MP4 Stream (HTTP 206 Partial Content):**
+   - 2.5 MB li aqlli burst oqimi: video bosilishi bilanoq 60-70 millisoniyada o'ynashni boshlaydi.
+   - Pipelined parallel MTProto yuklovchi: orqa fonda 4 ta parallel oqim orqali videoni uzluksiz to'ldiradi.
+   - 0-CPU va minimal RAM sarfi (FFmpeg talab qilinmaydi, butunlay toza oqim).
 
-2. 🚀 **0 Soniyali Tezkor Start (Zero-Buffering):**
-   - Video yuklanganda birinchi 3 MB tushishi bilanoq `segment_0.ts` atigi 80ms ichida kesilib, pleyerga uzatiladi.
+2. 🚀 **Video Boshi (Moov Atom) Avto-Kesh:**
+   - Har qanday videoning dastlabki 2.5 MB li qismi RAM va diskka keshlanadi, bu esa keyingi tomoshabinlarga videoni 0 millisoniyada ochib beradi.
 
-3. 🤖 **Kanalga Video Tashlanganda Avtomatik Javob & Pre-Segmentation:**
-   - Bot admin qilingan kanalga anime videosi tashlanganda:
-     - ⚡️ HLS URL (`master.m3u8`)
-     - 🔗 MP4 Direct Stream URL beradi.
-   - Orqa fonda videoni avtomatik tarzda HLS segmentlariga bo'lib, diskka keshlab qo'yadi.
+3. 🤖 **Kanalga Video Tashlanganda Avtomatik Yangi MP4 Havola:**
+   - Bot admin qilingan kanalga video tashlanganda:
+     - ⚡️ To'g'ridan-to'g'ri MP4 havola: `https://s3.animem.uz/api/medi/:channelId/:messageId.mp4`
+     - 📱 Onlayn pleyer havolasi: `https://s3.animem.uz/player/:channelId/:messageId`
+     - 📺 Sayt uchun iframe kodi: `<iframe src="..." ...></iframe>`
 
-4. 🛡 **Anti-Leech (Begona Saytlardan Himoya):**
-   - Faqat `animem.uz`, uning subdomenlari va rasmiy brauzer pleyerlariga ruxsat berilgan.
-   - Begona saytlar o'g'irlab iframe orqali qo'yganda avtomatik ravishda `403 Forbidden` bilan bloklanadi.
+4. 🛡 **Anti-Leech va Xavfsizlik:**
+   - Faqat `animem.uz`, uning subdomenlari va rasmiy pleyerlarga ruxsat berilgan.
+   - Resilient MTProto avto-avtorizatsiya: sessiya eskirganda bot token orqali o'zini avtomatik tiklaydi.
 
-5. 🎞 **Direct MP4 Stream (HTTP 206 Partial Content):**
-   - Telegram MTProto 4096-baytli aniq tekislash va bo'shliqlarsiz tezkor seek (oldinga-orqaga surish) qo'llab-quvvatlanadi.
+---
+
+## ☁️ Northflank da Joylashtirish (Tavsiya etiladi)
+
+1. **Northflank (northflank.com) hisobingizga kiring.**
+2. **Create New Service** -> **Combined Service** yoki **Deployment Service** ni tanlang.
+3. Git Repository sifatida `https://github.com/jasurfreefire3-beep/Animem-s3-bot` ni ulang.
+4. Build Type sifatida **Dockerfile** ni tanlang (loyihadagi `Dockerfile` avtomatik ishlatiladi).
+5. **Port:** `3000` (HTTP) qilib belgilang.
+6. **Environment Variables** bo'limiga quyidagilarni kiriting:
+   - `PORT`: `3000`
+   - `NODE_ENV`: `production`
+   - `TG_API_ID`: `6`
+   - `TG_API_HASH`: `eb06d4abfb49dc3eeb1aeb98ae0f581e`
+   - `TG_STREAM_BOT_TOKEN`: `8969080492:AAFeXz93y6CjIBv0AmdlfVlE0N53gf_J6gY`
+   - `TG_STREAM_DOMAIN`: `s3.animem.uz` (yoki Northflank taqdim etgan domain)
+   - `HEAD_BUFFER_SIZE`: `2621440`
+   - `CHUNK_BURST_SIZE`: `2621440`
+   - `RAM_LIMIT_MB`: `450`
+   - `ALLOWED_ORIGINS`: `https://animem.uz,https://www.animem.uz,http://localhost:5173,http://localhost:3000`
+7. **Deploy Service** tugmasini bosing. Loyiha bir necha soniyada ishga tushadi!
 
 ---
 
 ## ⚙️ VPS Serverga O'rnatish (Ubuntu / Debian)
 
-### 1-Usul: Node.js + PM2 orqali (Tavsiya etiladi)
+### 1-Usul: Node.js + PM2 orqali
 
-1. **VPS paketlarini yangilang va kerakli dasturlarni o'rnating:**
-   ```bash
-   sudo apt update && sudo apt upgrade -y
-   sudo apt install -y curl git ffmpeg
-   ```
-
-2. **Node.js (v20 yoki v22 LTS) o'rnating:**
-   ```bash
-   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-   sudo apt install -y nodejs
-   sudo npm install -g pm2
-   ```
-
-3. **Repozitoriyani klon qiling:**
+1. **Node.js o'rnating va repozitoriyani yuklang:**
    ```bash
    git clone https://github.com/jasurfreefire3-beep/Animem-s3-bot.git
    cd Animem-s3-bot
+   npm install --omit=dev
    ```
 
-4. **Kutubxonalarni o'rnating:**
-   ```bash
-   npm install --production
-   ```
-
-5. **.env sozlamalarini tekshiring:**
-   `.env` faylida barcha bot tokenlari va API kalitlari allaqachon to'ldirilgan.
-   Agar VPS domeningiz boshqa bo'lsa, `TG_STREAM_DOMAIN` ni o'zgartirishingiz mumkin:
-   ```bash
-   nano .env
-   ```
-
-6. **PM2 orqali orqa fonda (24/7) ishga tushiring:**
+2. **PM2 orqali ishga tushiring:**
    ```bash
    pm2 start ecosystem.config.cjs
    pm2 save
    pm2 startup
    ```
 
----
-
-### 2-Usul: Docker & Docker Compose orqali
-
-1. **Docker va Docker Compose o'rnatilgan VPS da:**
-   ```bash
-   git clone https://github.com/jasurfreefire3-beep/Animem-s3-bot.git
-   cd Animem-s3-bot
-   docker compose up -d --build
-   ```
-
-2. **Loglarni kuzatish:**
-   ```bash
-   docker compose logs -f
-   ```
-
----
-
-## 🌐 Nginx Reverse Proxy & SSL (Domain sozlash)
-
-Agar serveringizga domen ulamoqchi bo'lsangiz (masalan `s3.animem.uz`):
-
-1. **Nginx o'rnating:**
-   ```bash
-   sudo apt install -y nginx certbot python3-certbot-nginx
-   ```
-
-2. **Nginx konfiguratsiyasini yarating (`/etc/nginx/sites-available/s3.animem.uz`):**
-   ```nginx
-   server {
-       server_name s3.animem.uz;
-
-       client_max_body_size 0;
-       proxy_read_timeout 600s;
-       proxy_send_timeout 600s;
-
-       location / {
-           proxy_pass http://127.0.0.1:3000;
-           proxy_http_version 1.1;
-           proxy_set_header Upgrade $http_upgrade;
-           proxy_set_header Connection 'upgrade';
-           proxy_set_header Host $host;
-           proxy_set_header X-Real-IP $remote_addr;
-           proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-           proxy_set_header X-Forwarded-Proto $scheme;
-       }
-   }
-   ```
-
-3. **Saytni faollashtiring va bepul SSL o'rnating:**
-   ```bash
-   sudo ln -s /etc/nginx/sites-available/s3.animem.uz /etc/nginx/sites-enabled/
-   sudo nginx -t
-   sudo systemctl restart nginx
-   sudo certbot --nginx -d s3.animem.uz
-   ```
-
----
-
-## 🤖 Telegram Botdan Foydalanish
-
-1. `@auplodaprivatebot` ni Telegram kanalingizga **Admin** qilib qo'shing (Xabarlarni o'qish va yozish ruxsati bilan).
-2. Kanalga istalgan video (MP4 / MKV) yuklang.
-3. Bot 1 soniya ichida videoga reply qilib, HLS va MP4 havolalarini yuboradi.
-4. Ushbu HLS havolani **Animem.uz Admin Paneli**ga kiritishingiz mumkin!
+### 2-Usul: Docker orqali
+```bash
+docker compose up -d --build
+```

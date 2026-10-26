@@ -1,0 +1,39 @@
+kind: wasmer.io/App.v0
+name: animem-s3-bot
+app_id: da_RMMIrt4U1YWP
+owner: mosinjonovjasurbek00
+package: .
+env:
+  PORT: "3000"
+  NODE_ENV: "production"
+  TG_API_ID: "6"
+  TG_API_HASH: "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+  TG_STREAM_BOT_TOKEN: "8969080492:AAFeXz93y6CjIBv0AmdlfVlE0N53gf_J6gY"
+  TG_STREAM_SESSION: "1AgAOMTQ5LjE1NC4xNjcuNTEBu0LkASxyIP+4DV1EVwOyPP0+LigyN2uTMG0BynFf6AiovYeN7YFvsbpwqTGQlzwraJXiduxucjhtveeggWY1FPBGAKSLvQOQvax9WF3gCmHi9CC7KLNwZ9M4Kthte+ICJ8GhL7ysNpmpHd3RTwSHa1Z2bzj+45ha3lA99WA/+gqNUMro48EevIQr0ieNn6didCNGh/qOgmWfoNJyBuHluL0GLQTdpO1SYH+L0iNdQ/56pwf0JZ3/oUoqol7l16Y+IV2fXkv/a6qAtAQfTz7SpLuW48i2Jo9lnWcMQjI1v5EApE0R05oYJd8pEs0NwBez/Ym4za+N3bnPBaXdH6mfjXU="
+  TG_STREAM_DOMAIN: "s3.animem.uz"
+  TG_CHUNK_SIZE: "524288"
+  HEAD_BUFFER_SIZE: "2621440"
+  CHUNK_BURST_SIZE: "2621440"
+  RAM_LIMIT_MB: "450"
+  MAX_HEAD_CACHE_BYTES: "62914560"
+  ALLOWED_ORIGINS: "https://animem.uz,https://www.animem.uz,http://localhost:5173,http://localhost:3000"
+locality:
+  regions:
+    - fr-roub1
+annotations:
+  anybuild.run/config:
+    commands:
+      start: node --expose-gc --max-old-space-size=256 server.js
+    edgejs_enable: true
+    edgejs_precompile: true
+    name: out
+    node_install_inputs:
+    - package.json
+    node_package_manager: npm
+    node_package_name: animem-s3-stream-bot
+    node_remove_native_binaries: true
+    node_server: express
+    npm_version: '11'
+  anybuild.run/provider: node
+  anybuild.run/version: 0.33.0
+  wasmer.io/version: 7.5.0
