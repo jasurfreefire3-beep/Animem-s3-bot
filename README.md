@@ -16,8 +16,8 @@ Telegram kanallari orqali yuklangan videolarni to'g'ridan-to'g'ri internetda va 
 
 3. 🤖 **Kanalga Video Tashlanganda Avtomatik Yangi MP4 Havola:**
    - Bot admin qilingan kanalga video tashlanganda:
-     - ⚡️ To'g'ridan-to'g'ri MP4 havola: `https://s3.animem.uz/api/medi/:channelId/:messageId.mp4`
-     - 📱 Onlayn pleyer havolasi: `https://s3.animem.uz/player/:channelId/:messageId`
+     - ⚡️ To'g'ridan-to'g'ri MP4 havola: `https://animem-s3-bot-production.up.railway.app/api/medi/:channelId/:messageId.mp4`
+     - 📱 Onlayn pleyer havolasi: `https://animem-s3-bot-production.up.railway.app/player/:channelId/:messageId`
      - 📺 Sayt uchun iframe kodi: `<iframe src="..." ...></iframe>`
 
 4. 🛡 **Anti-Leech va Xavfsizlik:**
@@ -38,8 +38,8 @@ Telegram kanallari orqali yuklangan videolarni to'g'ridan-to'g'ri internetda va 
    - `NODE_ENV`: `production`
    - `TG_API_ID`: `6`
    - `TG_API_HASH`: `eb06d4abfb49dc3eeb1aeb98ae0f581e`
-   - `TG_STREAM_BOT_TOKEN`: `8969080492:AAFeXz93y6CjIBv0AmdlfVlE0N53gf_J6gY`
-   - `TG_STREAM_DOMAIN`: `s3.animem.uz` (yoki Northflank taqdim etgan domain)
+   - `TG_STREAM_BOT_TOKEN`: `9041641962:AAEispd_h1HyoJ0-VWz0Uo6CrItfMLjNBXQ`
+   - `TG_STREAM_DOMAIN`: `animem-s3-bot-production.up.railway.app` (yoki Railway / Northflank taqdim etgan domain)
    - `HEAD_BUFFER_SIZE`: `2621440`
    - `CHUNK_BURST_SIZE`: `2621440`
    - `RAM_LIMIT_MB`: `450`

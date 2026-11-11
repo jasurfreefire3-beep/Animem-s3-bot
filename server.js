@@ -64,8 +64,10 @@ const bigInt = require('big-integer');
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const TG_API_ID = parseInt(process.env.TG_API_ID || '6', 10);
 const TG_API_HASH = process.env.TG_API_HASH || 'eb06d4abfb49dc3eeb1aeb98ae0f581e';
-const TG_BOT_TOKEN = process.env.TG_STREAM_BOT_TOKEN || '8969080492:AAFeXz93y6CjIBv0AmdlfVlE0N53gf_J6gY';
-const TG_STREAM_DOMAIN = process.env.TG_STREAM_DOMAIN || 's3.animem.uz';
+const TG_BOT_TOKEN = process.env.TG_STREAM_BOT_TOKEN || '9041641962:AAEispd_h1HyoJ0-VWz0Uo6CrItfMLjNBXQ';
+const RAW_STREAM_DOMAIN = process.env.TG_STREAM_DOMAIN || 'animem-s3-bot-production.up.railway.app';
+const TG_STREAM_DOMAIN = RAW_STREAM_DOMAIN.replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+const STREAM_BASE_URL = `https://${TG_STREAM_DOMAIN}`;
 const CACHE_DIR = path.resolve(__dirname, process.env.CACHE_DIR || 'cache');
 
 // RAM va oqimni tejash limitlari
@@ -518,16 +520,46 @@ function registerTelegramEventHandler(tgClient) {
       if (!message) return;
       if (message.out) return; // Botning o'z xabarlariga javob bermaslik
 
-      const channelIdRaw = message.peerId?.channelId 
-        ? message.peerId.channelId.toString() 
-        : (message.chatId ? message.chatId.toString() : '');
-      const cleanChannelId = channelIdRaw.replace(/^-100/, '').replace(/^-/, '');
+      // 1. Shaxsiy chatda /start buyrug'i
+      if (message.message && typeof message.message === 'string' && message.message.trim().startsWith('/start')) {
+        try {
+          const inputChat = (await event.getInputChat().catch(() => null)) || message.chatId || message.peerId;
+          await tgClient.sendMessage(inputChat, {
+            message: `👋 <b>Assalomu alaykum!</b>\n\nMen <b>Animem S3 Video Streamer</b> botiman 🚀\n\nVideolarni ultra-tezkor MP4 va onlayn pleyer oqimiga aylantirish uchun:\n1. Meni Telegram kanalingizga <b>Admin</b> qilib qo'shing (<i>Post Messages</i> ruxsati bilan);\n2. Kanalga video tashlang — men darhol to'g'ridan-to'g'ri MP4 va pleyer havolasini yuboraman!`,
+            parseMode: 'html'
+          });
+          console.log(`✅ [Telegram Bot] /start xabariga javob berildi.`);
+        } catch (startErr) {
+          console.error(`❌ [Telegram Bot] /start javobida xatolik:`, startErr?.message || startErr);
+        }
+        return;
+      }
+
+      // 2. Chat va kanal ID ni aniqlash
+      let cleanChannelId = '';
+      if (message.peerId?.channelId) {
+        cleanChannelId = message.peerId.channelId.toString();
+      } else if (message.chatId) {
+        cleanChannelId = message.chatId.toString().replace(/^-100/, '').replace(/^-/, '');
+      } else if (message.peerId?.chatId) {
+        cleanChannelId = message.peerId.chatId.toString().replace(/^-100/, '').replace(/^-/, '');
+      } else if (message.peerId?.userId) {
+        cleanChannelId = message.peerId.userId.toString();
+      }
+      cleanChannelId = cleanChannelId.replace(/^-100/, '').replace(/^-/, '');
       const messageId = message.id;
 
       if (!cleanChannelId || !messageId) return;
 
-      // Agar xabar kanalga bog'langan guruhdagi avto-forward bo'lsa, tashlab ketish (faqat asosiy kanal postiga javob beriladi)
-      if (message.fwdFrom) {
+      console.log(`📩 [Telegram Event] Yangi xabar: ID=#${messageId}, chat=${cleanChannelId}, fwd=${!!message.fwdFrom}`);
+
+      let chat = null;
+      try {
+        chat = message.chat || event.chat || (await message.getChat().catch(() => null));
+      } catch {}
+
+      // Agar kanalga bog'langan guruhdagi avto-forward bo'lsa (muhokama guruhi), takrorlamaslik
+      if (message.fwdFrom && (chat?.megagroup || chat?.gigagroup)) {
         return;
       }
 
@@ -538,7 +570,9 @@ function registerTelegramEventHandler(tgClient) {
       }
 
       const mediaInfo = extractMediaFromMessage(message);
-      if (!mediaInfo) return;
+      if (!mediaInfo) {
+        return;
+      }
 
       // Qayta ishlangan deb belgilash
       processedTelegramMessages.add(dedupeKey);
@@ -549,7 +583,6 @@ function registerTelegramEventHandler(tgClient) {
 
       console.log(`🎬 [Telegram Streamer] Yangi video aniqlandi: "${mediaInfo.fileName}" (${formatBytes(mediaInfo.size)}) - Post #${messageId}`);
 
-      const chat = message.chat || event.chat || (await message.getChat().catch(() => null));
       if (cleanChannelId && chat && chat.accessHash) {
         knownChannels.set(cleanChannelId, {
           channelId: cleanChannelId,
@@ -566,9 +599,9 @@ function registerTelegramEventHandler(tgClient) {
       // ⚡️ LAHZADA OCHILISH: Yangi video tushishi bilan birinchi 2MB ni orqa fonda keshlab qo'yish (<1ms start)
       prefetchVideoHead(cleanChannelId, messageId, mediaInfo).catch(() => {});
 
-      const directUrl = `https://${TG_STREAM_DOMAIN}/api/medi/${cleanChannelId}/${messageId}.mp4`;
-      const embedUrl = `https://${TG_STREAM_DOMAIN}/embed/${cleanChannelId}/${messageId}`;
-      const playerUrl = `https://${TG_STREAM_DOMAIN}/player/${cleanChannelId}/${messageId}`;
+      const directUrl = `${STREAM_BASE_URL}/api/medi/${cleanChannelId}/${messageId}.mp4`;
+      const embedUrl = `${STREAM_BASE_URL}/embed/${cleanChannelId}/${messageId}`;
+      const playerUrl = `${STREAM_BASE_URL}/player/${cleanChannelId}/${messageId}`;
 
       let codecInfo = `🎞 <b>Format:</b> <code>H.264 (AVC)</code> ✅ <i>(Brauzerlarga 100% mos)</i>\n\n`;
       let warningBlock = '';
@@ -598,25 +631,71 @@ function registerTelegramEventHandler(tgClient) {
         streamLinksBlock +
         `🚀 <i>Animem.uz ultra-tezkor MP4 oqim tizimi.</i>`;
 
-      const targetPeer = message.peerId || message.chatId;
-
-      // Xabarni AYNAN 1 MARTA yuborish
+      // InputPeer ni 100% ishonchli aniqlash
+      let targetPeer = null;
       try {
-        await tgClient.sendMessage(targetPeer, {
-          message: replyHtml,
-          parseMode: 'html',
-          replyTo: messageId
-        });
-        console.log(`✅ [Telegram Streamer] Javob havolasi yuborildi: #${messageId} (Kanal: ${cleanChannelId})`);
-      } catch (replyErr) {
+        targetPeer = await event.getInputChat();
+      } catch {}
+
+      if (!targetPeer) {
         try {
+          targetPeer = await message.getInputChat();
+        } catch {}
+      }
+
+      if (!targetPeer && chat && chat.accessHash) {
+        targetPeer = new Api.InputPeerChannel({
+          channelId: bigInt(cleanChannelId),
+          accessHash: bigInt(chat.accessHash.toString())
+        });
+      }
+
+      if (!targetPeer && knownChannels.has(cleanChannelId)) {
+        targetPeer = new Api.InputPeerChannel({
+          channelId: bigInt(cleanChannelId),
+          accessHash: bigInt(knownChannels.get(cleanChannelId).accessHash)
+        });
+      }
+
+      if (!targetPeer) {
+        targetPeer = message.peerId || message.chatId;
+      }
+
+      // Xabarni yuborish: Kanallarda yangi post yoki reply sifatida
+      try {
+        if (chat && chat.broadcast) {
+          // Kanallarda alohida post qilib yuborish
           await tgClient.sendMessage(targetPeer, {
             message: replyHtml,
             parseMode: 'html'
           });
-          console.log(`✅ [Telegram Streamer] Javob post sifatida yuborildi: #${messageId}`);
-        } catch (postErr) {
-          console.error(`❌ [Telegram Streamer] Kanalga xabar yuborishda xatolik:`, postErr?.message || postErr);
+          console.log(`✅ [Telegram Streamer] Kanalga yangi post sifatida havola yuborildi: #${messageId} (Kanal: ${cleanChannelId})`);
+        } else {
+          // Guruh yoki shaxsiy chatda reply qilib yuborish
+          await tgClient.sendMessage(targetPeer, {
+            message: replyHtml,
+            parseMode: 'html',
+            replyTo: messageId
+          }).catch(async () => {
+            await tgClient.sendMessage(targetPeer, {
+              message: replyHtml,
+              parseMode: 'html'
+            });
+          });
+          console.log(`✅ [Telegram Streamer] Javob yuborildi: #${messageId} (Chat: ${cleanChannelId})`);
+        }
+      } catch (postErr) {
+        console.error(`❌ [Telegram Streamer] Kanalga xabar yuborishda xatolik:`, postErr?.message || postErr);
+        // Fallback: Agar targetPeer da xatolik bo'lsa
+        try {
+          const fallbackPeer = await tgClient.getInputEntity(cleanChannelId);
+          await tgClient.sendMessage(fallbackPeer, {
+            message: replyHtml,
+            parseMode: 'html'
+          });
+          console.log(`✅ [Telegram Streamer] Fallback orqali yuborildi: #${messageId}`);
+        } catch (fbErr) {
+          console.error(`❌ [Telegram Streamer] Fallback ham muvaffaqiyatsiz:`, fbErr?.message || fbErr);
         }
       }
     } catch (err) {
