@@ -2,6 +2,9 @@ FROM node:22-alpine
 
 WORKDIR /app
 
+# Zero-CPU HLS streaming uchun FFmpeg o'rnatish
+RUN apk add --no-cache ffmpeg
+
 # Railway va bulutli konteynerlar uchun xotira va port sozlamalari
 ENV NODE_ENV=production
 ENV PORT=8080
@@ -15,7 +18,7 @@ RUN npm install --omit=dev --no-audit --no-fund
 COPY . .
 
 # Kesh jildlarini yaratish
-RUN mkdir -p /app/cache/heads
+RUN mkdir -p /app/cache/heads /app/cache/hls
 
 EXPOSE 8080
 EXPOSE 3000
