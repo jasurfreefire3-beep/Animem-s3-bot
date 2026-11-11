@@ -61,7 +61,7 @@ const bigInt = require('big-integer');
 // ============================================================================
 // KONFIGURATSIYA VA KUCHSIZ SERVERLAR UCHUN OPTIMIZATSIYA SOZLAMALARI
 // ============================================================================
-const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 8080;
 const TG_API_ID = parseInt(process.env.TG_API_ID || '6', 10);
 const TG_API_HASH = process.env.TG_API_HASH || 'eb06d4abfb49dc3eeb1aeb98ae0f581e';
 const TG_BOT_TOKEN = process.env.TG_STREAM_BOT_TOKEN || '9041641962:AAEispd_h1HyoJ0-VWz0Uo6CrItfMLjNBXQ';
@@ -1513,27 +1513,56 @@ setInterval(autoCleanStorage, CLEANUP_INTERVAL_MIN * 60 * 1000);
 setTimeout(autoCleanStorage, 10000);
 
 // ============================================================================
-// SERVERNI ISHGA TUSHIRISH VA GRACEFUL SHUTDOWN
+// SERVERNI ISHGA TUSHIRISH VA GRACEFUL SHUTDOWN (Railway 8080 & 3000 DUAL PORT)
 // ============================================================================
-const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 [Animem S3 Video Server] http://0.0.0.0:${PORT} portida muvaffaqiyatli ishga tushdi!`);
-  console.log(`⚙️  [Konfiguratsiya] RAM: ${RAM_LIMIT_MB}MB | Head Cache: ${formatBytes(MAX_HEAD_CACHE_BYTES)} | Rejim: Ultra-Fast Direct MP4 Engine 🚀`);
-  setTimeout(() => {
-    getTelegramClient().catch(err => {
-      console.warn('⚠️ [Telegram Bot] Dastlabki ulanishda ogohlantirish:', err?.message || err);
-    });
-  }, 3000);
-});
+const activeServers = [];
 
-server.keepAliveTimeout = 65000;
-server.headersTimeout = 66000;
+function startListening(port) {
+  try {
+    const s = app.listen(port, '0.0.0.0', () => {
+      console.log(`🚀 [Animem S3 Video Server] http://0.0.0.0:${port} portida muvaffaqiyatli ishga tushdi!`);
+    });
+    s.keepAliveTimeout = 65000;
+    s.headersTimeout = 66000;
+    s.on('error', (err) => {
+      if (err.code !== 'EADDRINUSE') {
+        console.warn(`⚠️ [Port ${port}] Ogohlantirish:`, err?.message || err);
+      }
+    });
+    activeServers.push(s);
+    return s;
+  } catch (err) {
+    console.warn(`⚠️ [Port ${port}] Ishga tushirishda xatolik:`, err?.message || err);
+    return null;
+  }
+}
+
+// 1. Asosiy port (Railway odatda PORT=8080 yoki dinamik port beradi)
+const server = startListening(PORT);
+
+// 2. Dual-Port: Railway 8080 yoki 3000 portga so'rov yuborgan taqdirda ham ikkala portda eshitish
+const fallbackPorts = [8080, 3000].filter(p => p !== PORT);
+for (const p of fallbackPorts) {
+  startListening(p);
+}
+
+console.log(`⚙️  [Konfiguratsiya] RAM: ${RAM_LIMIT_MB}MB | Head Cache: ${formatBytes(MAX_HEAD_CACHE_BYTES)} | Rejim: Ultra-Fast Direct MP4 Engine 🚀`);
+setTimeout(() => {
+  getTelegramClient().catch(err => {
+    console.warn('⚠️ [Telegram Bot] Dastlabki ulanishda ogohlantirish:', err?.message || err);
+  });
+}, 3000);
 
 function handleShutdown(signal) {
   console.log(`🛑 [Shutdown] ${signal} qabul qilindi. Server to'xtatilmoqda...`);
   flushPersistedDataSync();
 
-  server.close(async () => {
-    console.log('🔌 [Shutdown] HTTP server yopildi.');
+  for (const s of activeServers) {
+    try { s.close(); } catch {}
+  }
+  console.log('🔌 [Shutdown] HTTP serverlar yopildi.');
+
+  (async () => {
     try {
       if (client && client.connected) {
         await client.disconnect();
@@ -1541,7 +1570,7 @@ function handleShutdown(signal) {
       }
     } catch {}
     process.exit(0);
-  });
+  })();
 
   setTimeout(() => {
     console.error('⚠️ [Shutdown] Majburiy to\'xtatildi (timeout).');
