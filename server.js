@@ -1580,23 +1580,26 @@ async function ensureSegmentAvailable(channelId, messageId, segNum) {
   const localStreamUrl = `http://127.0.0.1:${PORT}/api/medi/${cleanId}/${messageId}.mp4`;
 
   const slicePromise = new Promise((resolve, reject) => {
-    const ff = spawn('ffmpeg', [
+    const ffArgs = [
       '-ss', String(startTime),
       '-t', String(HLS_SEG_DURATION),
       '-i', localStreamUrl,
       '-c', 'copy',
-      '-bsf:v', bsfFilter,
       '-avoid_negative_ts', 'make_zero',
       '-fflags', '+genpts',
       '-f', 'mpegts',
       '-y',
       tempFile
-    ]);
+    ];
+
+    const ff = spawn('ffmpeg', ffArgs);
+    let ffStderr = '';
+    ff.stderr.on('data', (d) => { ffStderr += d.toString(); });
 
     const timer = setTimeout(() => {
       try { ff.kill('SIGKILL'); } catch {}
-      reject(new Error("Segment yaratishda timeout (15s)"));
-    }, 15000);
+      reject(new Error("Segment yaratishda timeout (35s)"));
+    }, 35000);
 
     ff.on('close', (code) => {
       clearTimeout(timer);
@@ -1609,6 +1612,7 @@ async function ensureSegmentAvailable(channelId, messageId, segNum) {
         }
       } else {
         try { if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile); } catch {}
+        console.warn(`⚠️ [FFmpeg Warning] Kod: ${code}, xatolik:`, ffStderr.slice(-400));
         reject(new Error(`FFmpeg exit code: ${code}`));
       }
     });
@@ -1639,8 +1643,8 @@ app.get([
   const numMsgId = parseInt(messageId, 10);
   if (!channelId || isNaN(numMsgId)) return res.status(400).send("Noto'g'ri parametrlar");
 
-  // Agar brauzerda to'g'ridan-to'g'ri ochilsa player sahifasiga yo'naltirish
-  if (req.headers.accept && req.headers.accept.includes('text/html') && !req.url.endsWith('.m3u8')) {
+  // Agar brauzerda to'g'ridan-to'g'ri ochilsa player sahifasiga yo'naltirish (Chrome desktop HLS.js talab qiladi)
+  if (req.headers.accept && req.headers.accept.includes('text/html')) {
     return res.redirect(302, `/player/${channelId}/${numMsgId}`);
   }
 
