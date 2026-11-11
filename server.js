@@ -1632,6 +1632,80 @@ async function ensureSegmentAvailable(channelId, messageId, segNum) {
   }
 }
 
+// ============================================================================
+// 3. EMBED & NATIVE HLS.JS WEB PLAYER (HLS + MP4 Fallback)
+// ============================================================================
+function renderHlsPlayerHtml(cleanChannelId, messageId) {
+  const cleanId = String(cleanChannelId).replace(/^-100/, '').replace(/^-/, '');
+  const cleanMsgId = String(messageId).replace(/\.mp4$/i, '');
+  const hlsUrl = `/api/tghls/${cleanId}/${cleanMsgId}/master.m3u8`;
+  const mp4Url = `/api/medi/${cleanId}/${cleanMsgId}.mp4`;
+
+  return `<!DOCTYPE html>
+<html lang="uz">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Animem Video Stream</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; background: #050508; overflow: hidden; display: flex; align-items: center; justify-content: center; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .video-wrap { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: #000; }
+    video { width: 100%; height: 100%; max-height: 100vh; object-fit: contain; outline: none; }
+    .badge { position: absolute; top: 12px; right: 12px; background: rgba(5, 5, 8, 0.85); backdrop-filter: blur(8px); color: #38bdf8; padding: 5px 12px; border-radius: 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; pointer-events: none; z-index: 10; border: 1px solid rgba(56,189,248,0.3); box-shadow: 0 4px 12px rgba(0,0,0,0.5); transition: opacity 0.5s; }
+  </style>
+</head>
+<body>
+  <div class="video-wrap">
+    <div id="badge" class="badge">⚡️ ANIMEM HLS</div>
+    <video id="video" controls autoplay playsinline preload="auto"></video>
+  </div>
+  <script>
+    const video = document.getElementById('video');
+    const badge = document.getElementById('badge');
+    const hlsUrl = "${hlsUrl}";
+    const mp4Url = "${mp4Url}";
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        maxBufferLength: 30,
+        maxMaxBufferLength: 60,
+        enableWorker: true,
+        lowLatencyMode: false,
+      });
+      hls.loadSource(hlsUrl);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, function() {
+        video.play().catch(function() {});
+      });
+      hls.on(Hls.Events.ERROR, function(event, data) {
+        if (data.fatal) {
+          console.warn('HLS xatoligi, MP4 oqimiga olinmoqda...');
+          badge.textContent = '🚀 ANIMEM MP4';
+          badge.style.color = '#34d399';
+          video.src = mp4Url;
+          video.play().catch(function() {});
+        }
+      });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = hlsUrl;
+      video.play().catch(function() {});
+    } else {
+      badge.textContent = '🚀 ANIMEM MP4';
+      badge.style.color = '#34d399';
+      video.src = mp4Url;
+      video.play().catch(function() {});
+    }
+
+    setTimeout(function() {
+      if (badge) badge.style.opacity = '0.3';
+    }, 4000);
+  </script>
+</body>
+</html>`;
+}
+
 // A. HLS VOD Playlist (.m3u8) - 10 millisekundda ro'yxatni yuklaydi
 app.get([
   '/api/tghls/:channelId/:messageId/master.m3u8',
@@ -1640,12 +1714,21 @@ app.get([
   '/api/tghls/:channelId/:messageId'
 ], async (req, res) => {
   const { channelId, messageId } = req.params;
-  const numMsgId = parseInt(messageId, 10);
-  if (!channelId || isNaN(numMsgId)) return res.status(400).send("Noto'g'ri parametrlar");
+  const cleanId = channelId ? channelId.replace(/^-100/, '').replace(/^-/, '') : '';
+  const cleanMsgId = messageId ? messageId.replace(/\.mp4$/i, '') : '';
+  const numMsgId = parseInt(cleanMsgId, 10);
+  if (!cleanId || isNaN(numMsgId)) return res.status(400).send("Noto'g'ri parametrlar");
 
-  // Agar brauzerda to'g'ridan-to'g'ri ochilsa player sahifasiga yo'naltirish (Chrome desktop HLS.js talab qiladi)
-  if (req.headers.accept && req.headers.accept.includes('text/html')) {
-    return res.redirect(302, `/player/${channelId}/${numMsgId}`);
+  // ⚡️ BRAUZERDA OCHILGANDA: Foydalanuvchi Chrome yoki brauzerda to'g'ridan-to'g'ri .m3u8 havolasini ochsa,
+  // video qotib turmasdan shu manzilning o'zida Hls.js pleyerida darhol o'ynasin!
+  const isBrowserDoc = (
+    req.headers['sec-fetch-dest'] === 'document' ||
+    (req.headers.accept && req.headers.accept.includes('text/html') && !req.headers.accept.includes('application/vnd.apple.mpegurl'))
+  );
+
+  if (isBrowserDoc) {
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    return res.send(renderHlsPlayerHtml(cleanId, numMsgId));
   }
 
   const meta = await getStreamMetadata(channelId, numMsgId);
@@ -1713,82 +1796,13 @@ app.get('/api/tghls/:channelId/:messageId/segment_:segNum.ts', async (req, res) 
   }
 });
 
-// ============================================================================
-// 3. EMBED & NATIVE HLS.JS WEB PLAYER (HLS + MP4 Fallback)
-// ============================================================================
+// C. Onlayn pleyer yo'nalishi
 app.get(['/player/:channelId/:messageId', '/embed/:channelId/:messageId'], (req, res) => {
   const { channelId, messageId } = req.params;
   const cleanId = channelId ? channelId.replace(/^-100/, '').replace(/^-/, '') : '';
   const cleanMsgId = messageId ? messageId.replace(/\.mp4$/i, '') : '';
-  const hlsUrl = `/api/tghls/${cleanId}/${cleanMsgId}/master.m3u8`;
-  const mp4Url = `/api/medi/${cleanId}/${cleanMsgId}.mp4`;
-
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(`<!DOCTYPE html>
-<html lang="uz">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Animem Video Stream</title>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.8/dist/hls.min.js"></script>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    html, body { width: 100%; height: 100%; background: #050508; overflow: hidden; display: flex; align-items: center; justify-content: center; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    .video-wrap { position: relative; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: #000; }
-    video { width: 100%; height: 100%; max-height: 100vh; object-fit: contain; outline: none; }
-    .badge { position: absolute; top: 12px; right: 12px; background: rgba(5, 5, 8, 0.85); backdrop-filter: blur(8px); color: #38bdf8; padding: 5px 12px; border-radius: 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; pointer-events: none; z-index: 10; border: 1px solid rgba(56,189,248,0.3); box-shadow: 0 4px 12px rgba(0,0,0,0.5); transition: opacity 0.5s; }
-  </style>
-</head>
-<body>
-  <div class="video-wrap">
-    <div id="badge" class="badge">⚡️ ANIMEM HLS</div>
-    <video id="video" controls autoplay playsinline preload="auto"></video>
-  </div>
-  <script>
-    const video = document.getElementById('video');
-    const badge = document.getElementById('badge');
-    const hlsUrl = "${hlsUrl}";
-    const mp4Url = "${mp4Url}";
-
-    if (Hls.isSupported()) {
-      const hls = new Hls({
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
-        enableWorker: true,
-        lowLatencyMode: false,
-      });
-      hls.loadSource(hlsUrl);
-      hls.attachMedia(video);
-      hls.on(Hls.Events.MANIFEST_PARSED, function() {
-        video.play().catch(function() {});
-      });
-      hls.on(Hls.Events.ERROR, function(event, data) {
-        if (data.fatal) {
-          console.warn('HLS xatoligi, MP4 oqimiga olinmoqda...');
-          badge.textContent = '🚀 ANIMEM MP4';
-          badge.style.color = '#34d399';
-          video.src = mp4Url;
-          video.play().catch(function() {});
-        }
-      });
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // Apple Safari va iOS qurilmalari uchun native HLS
-      video.src = hlsUrl;
-      video.play().catch(function() {});
-    } else {
-      // Fallback MP4
-      badge.textContent = '🚀 ANIMEM MP4';
-      badge.style.color = '#34d399';
-      video.src = mp4Url;
-      video.play().catch(function() {});
-    }
-
-    setTimeout(function() {
-      if (badge) badge.style.opacity = '0.3';
-    }, 4000);
-  </script>
-</body>
-</html>`);
+  res.send(renderHlsPlayerHtml(cleanId, cleanMsgId));
 });
 
 // ============================================================================
